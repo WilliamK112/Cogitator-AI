@@ -353,22 +353,22 @@ importers:
   packages/channels:
     dependencies:
       '@cogitator-ai/browser':
-        specifier: workspace:>=0.4.13
+        specifier: workspace:>=0.4.14
         version: link:../browser
       '@cogitator-ai/core':
         specifier: workspace:*
         version: link:../core
       '@cogitator-ai/mcp':
-        specifier: workspace:^19.3.3
+        specifier: workspace:^19.3.4
         version: link:../mcp
       '@cogitator-ai/memory':
         specifier: workspace:*
         version: link:../memory
       '@cogitator-ai/models':
-        specifier: workspace:^18.3.0
+        specifier: workspace:^18.4.0
         version: link:../models
       '@cogitator-ai/rag':
-        specifier: workspace:>=0.6.3
+        specifier: workspace:>=0.6.4
         version: link:../rag
       '@cogitator-ai/types':
         specifier: workspace:*
@@ -1746,7 +1746,7 @@ importers:
   packages/voice:
     dependencies:
       '@cogitator-ai/core':
-        specifier: workspace:>=0.37.0
+        specifier: workspace:>=0.38.0
         version: link:../core
       '@cogitator-ai/types':
         specifier: workspace:*

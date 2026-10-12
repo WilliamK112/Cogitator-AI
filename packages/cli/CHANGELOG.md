@@ -1,5 +1,25 @@
 # @cogitator-ai/cli
 
+## 0.7.0
+
+### Minor Changes
+
+- [#155](https://github.com/cogitator-ai/Cogitator-AI/pull/155) [`6f09cc8`](https://github.com/cogitator-ai/Cogitator-AI/commit/6f09cc8b941ea02fd8dff1cc2f28c16b22783292) - Bluesky and Threads channels in the scaffolder, `cogitator init` and `cogitator wizard`. A generated project keeps the Bluesky session and the Threads token in `.cogitator/tokens.json`, which is ignored by git, and `cogitator wizard --edit` keeps their settings.
+
+### Patch Changes
+
+- Updated dependencies [[`6f09cc8`](https://github.com/cogitator-ai/Cogitator-AI/commit/6f09cc8b941ea02fd8dff1cc2f28c16b22783292), [`6f09cc8`](https://github.com/cogitator-ai/Cogitator-AI/commit/6f09cc8b941ea02fd8dff1cc2f28c16b22783292), [`6f09cc8`](https://github.com/cogitator-ai/Cogitator-AI/commit/6f09cc8b941ea02fd8dff1cc2f28c16b22783292)]:
+  - @cogitator-ai/core@0.38.0
+  - @cogitator-ai/types@0.40.0
+  - @cogitator-ai/models@18.4.0
+  - @cogitator-ai/config@0.14.0
+  - @cogitator-ai/studio@0.1.4
+  - @cogitator-ai/channels@0.10.0
+  - create-cogitator-app@0.7.0
+  - @cogitator-ai/mcp@19.3.4
+  - @cogitator-ai/deploy@0.6.3
+  - @cogitator-ai/memory@0.12.4
+
 ## 0.6.5
 
 ### Patch Changes

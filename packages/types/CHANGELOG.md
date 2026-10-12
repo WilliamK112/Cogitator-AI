@@ -1,5 +1,36 @@
 # @cogitator-ai/types
 
+## 0.40.0
+
+### Minor Changes
+
+- [#155](https://github.com/cogitator-ai/Cogitator-AI/pull/155) [`6f09cc8`](https://github.com/cogitator-ai/Cogitator-AI/commit/6f09cc8b941ea02fd8dff1cc2f28c16b22783292) - Decision models and OpenRouter as a built-in provider.
+
+  - `cog.decide()` asks a decision model typed questions about a state and returns typed answers with probabilities instead of text: `noul` for yes or no, `choice` for one of several options, `score` for a level on a scale. Answers are typed by the questions, the request is checked before the call and the answer after it, and the call goes through the LLM retry policy, is checked against cost-routing budgets before it is sent, goes through `security.pii` masking or blocking, is priced and is reported to run observers as a run with one `llm.decide` span.
+  - `decisionTool()` turns fixed questions into a tool an agent passes the state to.
+  - OpenRouter's Decisions API is built in, with TypeSafe's Jev (`openrouter/typesafe/jev-1.13`). Other providers plug in through `llm.decisionBackends` and the `DecisionBackend` interface.
+  - OpenRouter is a built-in provider for chat too: `llm.providers.openrouter` with `apiKey` and an optional `baseUrl`, or `OPENROUTER_API_KEY` through `@cogitator-ai/config`.
+  - A chat run on a decision model fails at once with `CONFIGURATION_ERROR` instead of a provider error.
+  - `LLMRetryPolicy` and `retryLLMCall` give calls that are not chat the retry policy of LLM backends.
+  - `@cogitator-ai/models` knows Jev with its price, marks models with `kind: 'chat' | 'decision'` and adds `isDecisionModel()`.
+  - Studio shows `llm.decide` spans.
+
+  **Breaking:** a model string starting with `openrouter/` now runs on the OpenRouter provider. Before, the prefix stayed part of the model name on `llm.defaultProvider`.
+
+- [#155](https://github.com/cogitator-ai/Cogitator-AI/pull/155) [`6f09cc8`](https://github.com/cogitator-ai/Cogitator-AI/commit/6f09cc8b941ea02fd8dff1cc2f28c16b22783292) - Bluesky and Threads, for publishing posts and for talking with people.
+
+  - `BlueskyFeed` and `ThreadsFeed` publish posts with a link card, images with alt text, tags, languages and replies, and check each post against the feed's limits before sending it: 300 graphemes and 3000 bytes on Bluesky, 500 characters with emoji counted by their UTF-8 bytes on Threads. Links, mentions and hashtags become clickable facets on Bluesky, and Threads posts go through a media container that is published once Threads reports it ready.
+  - `FeedPublisher` sends one post to several feeds, now or at `publishAt`. Each feed is tracked on its own, so one failing feed does not stop the others. A delivery keeps the feed's idempotency key from before its first attempt, so an attempt after a crash or a lost answer finds the post instead of publishing it twice. Rate limits and a feed that is down are retried with backoff, a full Threads quota is waited out without spending attempts, the same `key` publishes once, text longer than a feed takes is cut at a word for that feed, and `dryRun` goes through every step but publishing.
+  - A publisher takes one due job at a time, extends its claim while it works and saves only while the claim is its own, so a worker that lost its claim never overwrites the one that took over.
+  - Jobs live in `MemoryPublishStore`, `FilePublishStore` or `PostgresPublishStore`, which lets several workers share them with `FOR UPDATE SKIP LOCKED` claims. Sessions and tokens live in `MemoryTokenStore`, `FileTokenStore` (an owner-only file, shared safely by the stores of one process) or `PostgresTokenStore`.
+  - The Threads long-lived token renews itself a week before it expires, once for calls made at the same time and once for processes sharing a store. A failed renewal keeps the current token and tries again an hour later.
+  - `BlueskyChannel` answers mentions, replies, quotes and direct messages through the Gateway, conversation requests included. `ThreadsChannel` answers replies and mentions, from signed webhooks or by polling. Long answers go out as threads of posts, and Markdown becomes plain text.
+  - Channels with `editable: false` get finished answers from the Gateway instead of streamed edits, since Bluesky and Threads cannot edit posts. `markdownToPlainText` is exported.
+  - `cogitator.yml` takes `channels.bluesky` and `channels.threads`, read from `BLUESKY_HANDLE`, `BLUESKY_APP_PASSWORD` and `THREADS_ACCESS_TOKEN`.
+  - `@cogitator-ai/types` adds `FeedChannel` (with `idempotencyKey()` and `FeedPublishOptions`), `FeedPost`, `PublishedPost`, `FeedLimits`, `TokenStore` and `StoredToken`, the `bluesky` and `threads` channel types and `Channel.editable`.
+
+  `@atproto/api` 0.24 or newer is an optional peer dependency, needed only for Bluesky.
+
 ## 0.39.0
 
 ### Minor Changes
