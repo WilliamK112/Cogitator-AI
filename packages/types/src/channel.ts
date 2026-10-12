@@ -7,7 +7,8 @@ import type { CompactionConfig, CompactionResult, Session, SessionManager } from
 import type { MemoryAdapter } from './memory';
 import type { ToolApprovalDecision, ToolApprovalRequest } from './runtime';
 
-export type ChannelType = 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'webchat' | (string & {});
+export type ChannelType =
+  'telegram' | 'discord' | 'slack' | 'whatsapp' | 'webchat' | 'bluesky' | 'threads' | (string & {});
 
 export type AttachmentType = 'image' | 'file' | 'audio' | 'video';
 
@@ -124,6 +125,12 @@ export interface Channel {
   start(): Promise<void>;
   stop(): Promise<void>;
 
+  /**
+   * Hands every incoming message to `handler`. A message counts as received
+   * once handed over: a handler that throws is logged and the message is not
+   * delivered again, since it may have been answered already. The Gateway
+   * catches its own errors and reports them through `onError`.
+   */
   onMessage(handler: (msg: ChannelMessage) => Promise<void>): void;
 
   sendText(channelId: string, text: string, options?: SendOptions): Promise<string>;
@@ -155,6 +162,12 @@ export interface Channel {
   readonly nativeMarkdown?: boolean;
   /** The longest message the channel sends as one, in characters, when it differs from the platform default */
   readonly maxMessageChars?: number;
+  /**
+   * False when sent messages cannot be edited, as on Bluesky and Threads: the
+   * gateway then sends each answer once it is finished instead of streaming
+   * it into a message it edits.
+   */
+  readonly editable?: boolean;
 
   /**
    * Several files sent together as one album, where the platform groups them; resolves with
