@@ -1,5 +1,11 @@
 # @cogitator-ai/channels
 
+## 0.10.1
+
+### Patch Changes
+
+- [#180](https://github.com/cogitator-ai/Cogitator-AI/pull/180) [`d7f5fcf`](https://github.com/cogitator-ai/Cogitator-AI/commit/d7f5fcf044784ac278a12772ae1cd0acea708cea) - `ThreadsFeed` publishes a post without its topic tag when Threads blocks tagging for the account (Graph API error subcode 2207051), instead of failing the post for good. The same post without the tag goes out, a warning says the tag was dropped, and a retry with the same idempotency key takes the untagged post for its own. `FeedError` carries the platform's `subcode` where it gives one.
+
 ## 0.10.0
 
 ### Minor Changes
