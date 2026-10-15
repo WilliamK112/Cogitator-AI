@@ -1,5 +1,22 @@
 # @cogitator-ai/types
 
+## 0.41.0
+
+### Minor Changes
+
+- [#183](https://github.com/cogitator-ai/Cogitator-AI/pull/183) [`9a31e38`](https://github.com/cogitator-ai/Cogitator-AI/commit/9a31e3897e0992061744bbcc5cf4075db2848b77) - Posts can quote other posts: `FeedPost.quote` is the id of a post of the same feed to show inside the new one.
+
+  - Bluesky embeds the quoted post as `app.bsky.embed.record`, or together with the post's images or link card as `app.bsky.embed.recordWithMedia`. The feed finds the quoted post's `cid` itself, from the posts it published, the account's own PDS or the AppView, and a quote can be a reply too.
+  - Threads passes it as `quote_post_id` in text, image and carousel posts and in replies. Threads accepts a link card in a quote post but does not show it, so the feed leaves `link` out of a post that quotes, and a retry by idempotency key matches a quote post by the post it quotes.
+  - An id that is not a post of the feed (an `at://` post URI on Bluesky, a media id on Threads) fails with `invalid_post` before anything is sent.
+
+- [#183](https://github.com/cogitator-ai/Cogitator-AI/pull/183) [`fba532a`](https://github.com/cogitator-ai/Cogitator-AI/commit/fba532a5fadc4d193f855c8aee0b44f48f9e0619) - A run that fails still reports what it spent.
+
+  - `onRunError`, of run options and of run observers, gets a third argument: the tokens and cost of every model call that finished (`RunUsage`, the shape of `RunResult.usage`). A run cut short by its timeout or an abort used to report nothing, though its calls were paid for.
+  - A `RUN_TIMEOUT` error carries the same in `details.usage`.
+  - Each `llm.chat` span carries its call's cost in `llm.cost`, so a tracer sees spending call by call.
+  - The Langfuse exporter keeps the usage of a failed run in its trace metadata, and decision runs pass theirs to `onRunError` too.
+
 ## 0.40.0
 
 ### Minor Changes

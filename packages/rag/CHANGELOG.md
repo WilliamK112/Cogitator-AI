@@ -1,5 +1,17 @@
 # @cogitator-ai/rag
 
+## 0.7.0
+
+### Minor Changes
+
+- [#183](https://github.com/cogitator-ai/Cogitator-AI/pull/183) [`9ea52d8`](https://github.com/cogitator-ai/Cogitator-AI/commit/9ea52d872777486b674d627b0ceae2d3e749f416) - `WebLoader` can load the first part of a page over `maxResponseBytes`: with `onTooLarge: 'truncate'` it stops the download at the limit and loads what came, marking the document `truncated: true` in its metadata. A page over the limit no longer fails the whole load. The first part holds the text only when the page puts it there: many news pages carry megabytes of scripts before their article, so keep `maxResponseBytes` above the pages you load and use `truncate` as a safety net, not to lower the limit. `onTooLarge: 'fail'` stays the default.
+
+### Patch Changes
+
+- Updated dependencies [[`9a31e38`](https://github.com/cogitator-ai/Cogitator-AI/commit/9a31e3897e0992061744bbcc5cf4075db2848b77), [`fba532a`](https://github.com/cogitator-ai/Cogitator-AI/commit/fba532a5fadc4d193f855c8aee0b44f48f9e0619)]:
+  - @cogitator-ai/types@0.41.0
+  - @cogitator-ai/memory@0.12.5
+
 ## 0.6.4
 
 ### Patch Changes

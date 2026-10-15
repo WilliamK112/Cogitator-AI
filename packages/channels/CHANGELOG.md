@@ -1,5 +1,25 @@
 # @cogitator-ai/channels
 
+## 0.11.0
+
+### Minor Changes
+
+- [#183](https://github.com/cogitator-ai/Cogitator-AI/pull/183) [`9a31e38`](https://github.com/cogitator-ai/Cogitator-AI/commit/9a31e3897e0992061744bbcc5cf4075db2848b77) - Posts can quote other posts: `FeedPost.quote` is the id of a post of the same feed to show inside the new one.
+
+  - Bluesky embeds the quoted post as `app.bsky.embed.record`, or together with the post's images or link card as `app.bsky.embed.recordWithMedia`. The feed finds the quoted post's `cid` itself, from the posts it published, the account's own PDS or the AppView, and a quote can be a reply too.
+  - Threads passes it as `quote_post_id` in text, image and carousel posts and in replies. Threads accepts a link card in a quote post but does not show it, so the feed leaves `link` out of a post that quotes, and a retry by idempotency key matches a quote post by the post it quotes.
+  - An id that is not a post of the feed (an `at://` post URI on Bluesky, a media id on Threads) fails with `invalid_post` before anything is sent.
+
+### Patch Changes
+
+- Updated dependencies [[`9a31e38`](https://github.com/cogitator-ai/Cogitator-AI/commit/9a31e3897e0992061744bbcc5cf4075db2848b77), [`fba532a`](https://github.com/cogitator-ai/Cogitator-AI/commit/fba532a5fadc4d193f855c8aee0b44f48f9e0619), [`9ea52d8`](https://github.com/cogitator-ai/Cogitator-AI/commit/9ea52d872777486b674d627b0ceae2d3e749f416)]:
+  - @cogitator-ai/types@0.41.0
+  - @cogitator-ai/core@0.39.0
+  - @cogitator-ai/rag@0.7.0
+  - @cogitator-ai/browser@0.4.15
+  - @cogitator-ai/mcp@19.3.5
+  - @cogitator-ai/memory@0.12.5
+
 ## 0.10.1
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 {
   "name": "@cogitator-ai/channels",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "Messaging channel connectors and Gateway for Cogitator AI agents",
   "keywords": [
     "cogitator",
@@ -60,10 +60,10 @@
     "ws": "^8.22.0"
   },
   "peerDependencies": {
-    "@cogitator-ai/browser": "workspace:>=0.4.14",
-    "@cogitator-ai/mcp": "workspace:^19.3.4",
+    "@cogitator-ai/browser": "workspace:>=0.4.15",
+    "@cogitator-ai/mcp": "workspace:^19.3.5",
     "@cogitator-ai/models": "workspace:^18.4.0",
-    "@cogitator-ai/rag": "workspace:>=0.6.4",
+    "@cogitator-ai/rag": "workspace:>=0.7.0",
     "@huggingface/transformers": ">=3.0.0",
     "@slack/bolt": ">=3.0.0",
     "@whiskeysockets/baileys": "^6.0.0 || >=7.0.0-0",
