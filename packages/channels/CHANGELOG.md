@@ -1,5 +1,19 @@
 # @cogitator-ai/channels
 
+## 0.11.2
+
+### Patch Changes
+
+- [#199](https://github.com/cogitator-ai/Cogitator-AI/pull/199) [`fd99224`](https://github.com/cogitator-ai/Cogitator-AI/commit/fd992243b89f3941f76c2acb607b59468a35480a) - Packages declare `"sideEffects": false`, so bundlers can leave out the modules an app does not use. None of them runs code at import time that depends on being kept. The repository URL in each package.json uses the `git+https` form npm expects.
+- Updated dependencies [[`fd99224`](https://github.com/cogitator-ai/Cogitator-AI/commit/fd992243b89f3941f76c2acb607b59468a35480a)]:
+  - @cogitator-ai/browser@0.4.16
+  - @cogitator-ai/core@0.39.1
+  - @cogitator-ai/mcp@19.3.6
+  - @cogitator-ai/memory@0.12.6
+  - @cogitator-ai/models@18.4.1
+  - @cogitator-ai/rag@0.7.1
+  - @cogitator-ai/types@0.41.1
+
 ## 0.11.1
 
 ### Patch Changes

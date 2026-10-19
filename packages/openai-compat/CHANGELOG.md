@@ -1,5 +1,17 @@
 # @cogitator-ai/openai-compat
 
+## 21.2.6
+
+### Patch Changes
+
+- [#199](https://github.com/cogitator-ai/Cogitator-AI/pull/199) [`fd99224`](https://github.com/cogitator-ai/Cogitator-AI/commit/fd992243b89f3941f76c2acb607b59468a35480a) - `OpenAIAdapter.createThread`, `getThread` and `updateThread` are typed as returning `Thread` for TypeScript projects on `moduleResolution: node16` or `nodenext`. Their declarations pointed at a module path those settings cannot resolve, so the methods came out as `any` there.
+
+- [#199](https://github.com/cogitator-ai/Cogitator-AI/pull/199) [`fd99224`](https://github.com/cogitator-ai/Cogitator-AI/commit/fd992243b89f3941f76c2acb607b59468a35480a) - Packages declare `"sideEffects": false`, so bundlers can leave out the modules an app does not use. None of them runs code at import time that depends on being kept. The repository URL in each package.json uses the `git+https` form npm expects.
+- Updated dependencies [[`fd99224`](https://github.com/cogitator-ai/Cogitator-AI/commit/fd992243b89f3941f76c2acb607b59468a35480a)]:
+  - @cogitator-ai/core@0.39.1
+  - @cogitator-ai/server-shared@0.5.6
+  - @cogitator-ai/types@0.41.1
+
 ## 21.2.5
 
 ### Patch Changes
