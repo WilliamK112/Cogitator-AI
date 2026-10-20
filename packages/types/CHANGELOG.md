@@ -1,5 +1,11 @@
 # @cogitator-ai/types
 
+## 0.47.0
+
+### Minor Changes
+
+- [#217](https://github.com/cogitator-ai/Cogitator-AI/pull/217) [`ed48837`](https://github.com/cogitator-ai/Cogitator-AI/commit/ed4883796a82b5f2b832a5bb45ba861fb0b17f45) - `memory.embedding` takes an `EmbeddingService` of your own as well as a provider's config. The runtime uses it as it is for the context builder and the embedding store, so a provider without a built-in service, or a cache in front of one, plugs in without wrapping the runtime. A config with `provider` works as before. A service is code, so it is passed to `new Cogitator()`, while `cogitator.yml` and `defineConfig()` keep taking provider configs only.
+
 ## 0.46.0
 
 ### Minor Changes
