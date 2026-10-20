@@ -295,7 +295,7 @@ const cog = new Cogitator({
     postgres: { connectionString: process.env.DATABASE_URL! },
     embedding: { provider: 'openai', apiKey: process.env.OPENAI_API_KEY! },
     contextBuilder: {
-      maxTokens: 8000, // default 4000
+      maxTokens: 8000, // default: the context window of the run's model
       strategy: 'hybrid', // 'recent' (default) | 'relevant' | 'hybrid'
       includeFacts: true,
       includeSemanticContext: true,
@@ -416,7 +416,8 @@ const context = await builder.build({
   systemPrompt: 'You are a helpful assistant.',
   currentInput: 'What did we decide about the launch?',
 });
-// context.messages, context.facts, context.semanticResults, context.tokenCount, context.truncated
+// context.messages, context.facts, context.semanticResults, context.tokenCount, context.truncated,
+// context.dropped (what did not fit the budget)
 ```
 
 ---

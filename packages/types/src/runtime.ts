@@ -88,6 +88,13 @@ export interface CogitatorConfig {
      * provider's cache hits lower the run's cost.
      */
     promptCache?: PromptCacheConfig | false;
+    /**
+     * When a model an agent falls back from (`fallbackModels`) is skipped. Each model has its
+     * own breaker, shared by every run of this runtime: after `failureThreshold` failures in a
+     * row, or at once for an out-of-quota account, a rejected key or a missing model, turns go
+     * straight to the next model for `resetTimeout` ms, and then try it again.
+     */
+    modelCircuitBreaker?: ModelCircuitBreakerConfig;
   };
   /**
    * Where paused runs are kept. Defaults to the memory adapter's threads (so
@@ -140,6 +147,26 @@ export interface CogitatorConfig {
   deploy?: DeployConfig;
 }
 
+/** See `CogitatorConfig.llm.modelCircuitBreaker`. */
+export interface ModelCircuitBreakerConfig {
+  /** Failures in a row that make a model be skipped (default 5) */
+  failureThreshold?: number;
+  /** How long a failing model is skipped, in ms (default 30 000) */
+  resetTimeout?: number;
+  /** Calls that must succeed after `resetTimeout` before the model counts as healthy (default 3) */
+  halfOpenRequests?: number;
+}
+
+/** A turn of a run moved from one model to the next of the agent's `fallbackModels`. */
+export interface ModelFallbackEvent {
+  /** The model that failed, as `provider/model` */
+  from: string;
+  /** The model the turn goes on with, as `provider/model` */
+  to: string;
+  /** Why `from` failed: its error, or a `CIRCUIT_OPEN` error when it was skipped */
+  error: Error;
+}
+
 export type ImageInput =
   string | { data: string; mimeType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp' };
 
@@ -147,13 +174,21 @@ export type AudioFormat = 'mp3' | 'mp4' | 'mpeg' | 'mpga' | 'm4a' | 'wav' | 'web
 
 export type AudioInput = string | { data: string; format: AudioFormat };
 
-export interface RunOptions {
+export interface RunOptions<TDeps = unknown> {
   input: string;
   /** Images to include with the input. Can be URLs or base64 encoded data. */
   images?: ImageInput[];
   /** Audio files to transcribe and include with the input. Can be URLs or base64 encoded data. */
   audio?: AudioInput[];
+  /** Data added to the system prompt for this run, as JSON: the model reads it */
   context?: Record<string, unknown>;
+  /**
+   * Your own values for the run's tools, such as a database client, a logger or the signed-in
+   * user: tools get them as `context.deps`. Unlike `context`, they never reach the model, the
+   * memory, spans or a paused run's checkpoint, so pass them again to `resume()`. Required when
+   * the agent declares its deps type (`new Agent<Deps>(...)`)
+   */
+  deps?: TDeps;
   threadId?: string;
   timeout?: number;
   /** Abort signal for cancelling the run. */
@@ -167,6 +202,8 @@ export interface RunOptions {
   onReasoning?: (delta: string) => void;
   /** Called when an agent hands the conversation over to another */
   onHandoff?: (handoff: HandoffEvent) => void;
+  /** Called when a turn moves from a failing model to the next of the agent's `fallbackModels` */
+  onModelFallback?: (event: ModelFallbackEvent) => void;
   /** Overrides the agent's `reasoning` for this run */
   reasoning?: ReasoningConfig;
   /**
@@ -233,6 +270,12 @@ export interface RunOptions {
   channelId?: string;
 }
 
+/**
+ * `deps` as a run of an agent with deps type `TDeps` must pass them: required when the agent
+ * declares its deps type, optional otherwise.
+ */
+export type RunDeps<TDeps> = unknown extends TDeps ? { deps?: unknown } : { deps: TDeps };
+
 export interface PromptsConfig {
   /** Default: in process memory */
   versions?: InstructionVersionStore;
@@ -291,6 +334,10 @@ export interface ToolInvocationOptions {
    * `agentId`, `runId` or `signal`
    */
   context?: Record<string, unknown>;
+  /**
+   * `deps` for the tool, as a run passes them (`RunOptions.deps`)
+   */
+  deps?: unknown;
   /**
    * Decides a call that needs approval (`requiresApproval`, or the guardrails), as
    * `RunOptions.onApproval` does in a run. Without it `guardrails.onToolApproval` decides. A call
@@ -400,8 +447,8 @@ export interface RunCheckpointStore {
 }
 
 /** Options for `cogitator.resume()`: run options, minus what the checkpoint fixes. */
-export interface ResumeOptions extends Omit<
-  RunOptions,
+export interface ResumeOptions<TDeps = unknown> extends Omit<
+  RunOptions<TDeps>,
   'input' | 'images' | 'audio' | 'context' | 'threadId' | 'threadAccess'
 > {
   /**
@@ -433,7 +480,10 @@ export interface RunResult {
   readonly runId: string;
   readonly agentId: string;
   readonly threadId: string;
-  /** Actual model used (may differ from agent.model if cost routing is enabled) */
+  /**
+   * The model that gave the final answer, as `provider/model`, when it may differ from the
+   * agent's `model`: cost routing picked it, or the turn fell back to one of `fallbackModels`
+   */
   readonly modelUsed?: string;
   readonly usage: {
     readonly inputTokens: number;

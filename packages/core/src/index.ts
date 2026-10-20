@@ -371,12 +371,14 @@ export type { ErrorDetails, CogitatorErrorOptions } from '@cogitator-ai/types';
 
 export type {
   AgentConfig,
+  FallbackModel,
   ResponseFormat,
   Tool,
   ApprovalCheck,
   ToolAnnotations,
   ToolConfig,
   ToolContext,
+  BaseToolContext,
   ToolSchema,
   Message,
   MessageRole,
@@ -392,6 +394,9 @@ export type {
   FinishReason,
   CogitatorConfig,
   RunOptions,
+  RunDeps,
+  ModelFallbackEvent,
+  ModelCircuitBreakerConfig,
   RunObserver,
   RunResult,
   RunBlockReason,
@@ -613,7 +618,7 @@ export type {
 } from '@cogitator-ai/types';
 export { DEFAULT_INJECTION_CONFIG } from '@cogitator-ai/types';
 
-export { ContextManager } from './context/index';
+export { ContextManager, modelContextWindow } from './context/index';
 export {
   TruncateStrategy,
   SlidingWindowStrategy,

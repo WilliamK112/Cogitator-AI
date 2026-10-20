@@ -364,11 +364,13 @@ const context = await builder.build({
   userId: 'alice', // optional: leave out other users' facts and embeddings
   systemPrompt: 'You are a helpful assistant.',
   currentInput: 'What did we discuss yesterday?', // used for semantic retrieval
+  maxTokens: 128_000, // optional: this build's budget, e.g. the model's context window
 });
 
 // context.messages — ready to send to LLM
 // context.tokenCount — tokens used
 // context.truncated — whether history was cut
+// context.dropped: entries, facts, semanticResults and graphNodes left out, with tokenCount
 // context.facts — facts included in system prompt
 // context.semanticResults — embeddings included
 // context.graphContext — graph nodes/edges, when includeGraphContext is on
@@ -390,8 +392,8 @@ Facts (up to 10% of the budget), semantic context (top 5 embeddings scoring ≥ 
 
 ```typescript
 interface ContextBuilderConfig {
-  maxTokens: number;
-  reserveTokens?: number; // default: 10% of maxTokens (min 100)
+  maxTokens?: number; // without it, build() needs options.maxTokens
+  reserveTokens?: number; // default: 10% of the budget (min 100)
   strategy: ContextStrategy;
   includeSystemPrompt?: boolean; // default: true
   includeFacts?: boolean; // default: false
@@ -515,11 +517,11 @@ interface MemoryConfig {
 
   embedding?: EmbeddingServiceConfig; // { provider: 'openai' | 'ollama' | 'google', apiKey?, model?, baseUrl?, dimensions? }
 
-  contextBuilder?: Partial<ContextBuilderConfig>; // maxTokens defaults to 4000, strategy to 'recent'
+  contextBuilder?: Partial<ContextBuilderConfig>; // maxTokens defaults to what the run's model has room for, strategy to 'recent'
 }
 ```
 
-With `contextBuilder` set, a Postgres store is also used as the fact adapter, and as the embedding adapter unless `memory.qdrant` is set. The runtime creates the Postgres `embeddings` table with the vector size of `memory.embedding` (768 without one). Without `contextBuilder`, a run loads the last 20 entries of the thread.
+With `contextBuilder` set and no `maxTokens`, each run's history budget is the context window of the model the run starts on (from the model registry, else the model family, else 8192 tokens, and at most 4096 on Ollama, which serves no more by default, except Ollama Cloud), minus room for the answer (the agent's `maxTokens`, else 15% of the window, at most half of it), the tool schemas and the input, and below the point where `context` compression would start when it is on. The builder keeps `reserveTokens` of it free as slack. Set `maxTokens` to cap the history and the cost of long threads, or to use a larger context your Ollama server runs with. With `contextBuilder` set, a Postgres store is also used as the fact adapter, and as the embedding adapter unless `memory.qdrant` is set. The runtime creates the Postgres `embeddings` table with the vector size of `memory.embedding` (768 without one). Without `contextBuilder`, a run loads the last 20 entries of the thread.
 
 ---
 

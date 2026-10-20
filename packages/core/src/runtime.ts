@@ -25,6 +25,7 @@ import type {
   HandoffEvent,
   ResumeOptions,
   RunCheckpoint,
+  RunDeps,
   RunCheckpointStore,
   RunPrompt,
   Tool,
@@ -37,10 +38,15 @@ import type {
 import { type Agent } from './agent';
 import { ToolRegistry } from './registry';
 import { createLLMBackend } from './llm/index';
-import { llmInvalidResponse } from './llm/errors';
+import { LLMError, llmInvalidResponse } from './llm/errors';
 import { isLLMProvider } from './llm/providers';
 import { createLLMBackendFromPlugin, hasLLMPlugin } from './llm/plugin';
 import { withLLMRetry } from './llm/retry';
+import { ModelFallbackChain, type ModelCandidate } from './llm/model-fallback';
+import { modelContextWindow } from './context/model-window';
+import { countMessagesTokens, countTokens } from '@cogitator-ai/memory';
+import { TruncateStrategy } from './context/strategies/index';
+import { sanitizeToolHistory } from './utils/tool-history';
 import { normalizeTurn } from './llm/turn';
 import { PiiMasker, withPiiDecisions, withPiiMasking } from './security/pii';
 import { createLoggerFromConfig, getLogger, setLogger } from './logger';
@@ -192,6 +198,7 @@ export class Cogitator implements ToolInvoker {
   /** Prices model calls whose provider reports no cost: by `llm.pricing`, then by the model registry. */
   readonly pricer: CallPricer;
   private backends = new Map<string, LLMBackend>();
+  private modelChain?: ModelFallbackChain;
   private readonly decisionBackends = new Map<string, DecisionBackend>();
   private processCheckpoints?: InMemoryRunCheckpointStore;
   private promptRegistry?: PromptRegistry;
@@ -258,6 +265,7 @@ export class Cogitator implements ToolInvoker {
    * @param options.input - User input/prompt for the agent
    * @param options.threadId - Thread ID for memory persistence
    * @param options.context - Additional context to include in system prompt
+   * @param options.deps - Values for the agent's tools (`context.deps`), kept out of the prompt
    * @param options.stream - Enable streaming responses
    * @param options.onToken - Callback for each streamed token
    * @param options.onToolCall - Callback when a tool is called
@@ -281,7 +289,10 @@ export class Cogitator implements ToolInvoker {
    * console.log('Cost:', result.usage.cost);
    * ```
    */
-  async run(agent: Agent, options: RunOptions): Promise<RunResult> {
+  async run<TDeps = unknown>(
+    agent: Agent<TDeps>,
+    options: RunOptions<TDeps> & RunDeps<TDeps>
+  ): Promise<RunResult> {
     return this.execute(agent, options);
   }
 
@@ -302,10 +313,10 @@ export class Cogitator implements ToolInvoker {
    * }
    * ```
    */
-  async resume(
-    agent: Agent,
+  async resume<TDeps = unknown>(
+    agent: Agent<TDeps>,
     target: RunCheckpoint | string,
-    options: ResumeOptions = {}
+    ...[options = {}]: ResumeArgs<TDeps>
   ): Promise<RunResult> {
     if (typeof target !== 'string' && target.version !== 1) {
       throw new CogitatorError({
@@ -343,10 +354,10 @@ export class Cogitator implements ToolInvoker {
    * if (result.error) console.error(result.error);
    * ```
    */
-  async invokeTool(
-    tool: Tool,
+  async invokeTool<TParams, TResult, TDeps = unknown>(
+    tool: Tool<TParams, TResult, TDeps>,
     args: unknown,
-    options: ToolInvocationOptions = {}
+    ...[options = {}]: InvocationArgs<TDeps>
   ): Promise<ToolInvocationResult> {
     const toolCall: ToolCall = {
       id: options.toolCallId ?? `call_${nanoid(12)}`,
@@ -424,6 +435,7 @@ export class Cogitator implements ToolInvoker {
         ...(options.userId !== undefined && { userId: options.userId }),
         ...(options.channelType !== undefined && { channelType: options.channelType }),
         ...(options.channelId !== undefined && { channelId: options.channelId }),
+        ...(options.deps !== undefined && { deps: options.deps }),
       },
       approvedByUser,
       this.config.sandbox?.allowNativeFallback !== false
@@ -682,9 +694,20 @@ export class Cogitator implements ToolInvoker {
         }
 
         await this.abandonPausedRun(agent, runOptions, threadId);
-        messages = await this.prepareMessages(agent, runOptions, input, threadId);
+        messages = await this.prepareMessages(
+          agent,
+          runOptions,
+          input,
+          threadId,
+          this.historyBudget(agent, effectiveModel, routeProvider, registry, input)
+        );
       }
 
+      let candidates = this.modelCandidates(active, effectiveModel, routeProvider, {
+        backend,
+        model,
+      });
+      let fellBackTo: string | undefined;
       const allToolCalls: ToolCall[] = [...(checkpoint?.toolCalls ?? [])];
       let totalInputTokens = checkpoint?.usage.inputTokens ?? 0;
       let totalOutputTokens = checkpoint?.usage.outputTokens ?? 0;
@@ -766,6 +789,10 @@ export class Cogitator implements ToolInvoker {
         effectiveModel = this.resolveModel(target);
         routeProvider = target.config.provider;
         ({ backend, model } = this.route(effectiveModel, routeProvider));
+        candidates = this.modelCandidates(target, effectiveModel, routeProvider, {
+          backend,
+          model,
+        });
         reasoning = options.reasoning ?? target.config.reasoning;
         responseFormat = toLLMResponseFormat(target.config.responseFormat);
         lastToolCallSig = '';
@@ -883,6 +910,7 @@ export class Cogitator implements ToolInvoker {
                 userId: options.userId,
                 channelType: options.channelType,
                 channelId: options.channelId,
+                ...(options.deps !== undefined && { deps: options.deps }),
               },
               decision?.approved === true,
               this.config.sandbox?.allowNativeFallback !== false
@@ -1043,111 +1071,158 @@ export class Cogitator implements ToolInvoker {
         agentContext.previousActions = [...allActions];
 
         const llmSpanStart = Date.now();
+        const recordCall = (answer: ChatResponse, candidate: ModelCandidate): void => {
+          const spentBefore = costMeter.total(costModel);
+          costMeter.add(answer.usage, candidate.name);
+          const callCost = costMeter.total(costModel) - spentBefore;
+          spans.push(
+            createSpan(
+              'llm.chat',
+              traceId,
+              rootSpanId,
+              llmSpanStart,
+              Date.now(),
+              {
+                'llm.model': candidate.model,
+                'llm.iteration': iterations,
+                'llm.input_tokens': answer.usage.inputTokens,
+                'llm.output_tokens': answer.usage.outputTokens,
+                'llm.cost': callCost,
+                ...(answer.usage.cachedInputTokens && {
+                  'llm.cached_input_tokens': answer.usage.cachedInputTokens,
+                }),
+                ...(answer.usage.reasoningTokens && {
+                  'llm.reasoning_tokens': answer.usage.reasoningTokens,
+                }),
+                'llm.finish_reason': answer.finishReason,
+              },
+              answer.finishReason === 'error' ? 'error' : 'ok',
+              'client',
+              options.onSpan
+            )
+          );
+          totalInputTokens += answer.usage.inputTokens;
+          totalOutputTokens += answer.usage.outputTokens;
+          cachedInputTokens += answer.usage.cachedInputTokens ?? 0;
+          cacheWriteTokens += answer.usage.cacheWriteTokens ?? 0;
+          reasoningTokens += answer.usage.reasoningTokens ?? 0;
+          if (answer.usage.cost === undefined) this.pricer.noteUnpriced(candidate.name);
+          this.state.costRouter?.recordCost({
+            runId,
+            agentId: agent.id,
+            threadId,
+            model: candidate === candidates[0] ? effectiveModel : candidate.name,
+            inputTokens: answer.usage.inputTokens,
+            outputTokens: answer.usage.outputTokens,
+            cost: callCost,
+          });
+        };
         const turnToolChoice = limit.closingTurn
           ? 'none'
           : toolChoiceForTurn(requestedToolChoice, allToolCalls.length > 0, registry);
 
-        let response: ChatResponse;
-        if (streaming) {
-          response = await waitForAbortable(
-            streamChat(
-              backend,
-              model,
-              messages,
-              registry,
-              active,
-              turnTokens,
-              abortController.signal,
-              responseFormat,
-              {
-                reasoning,
-                cache: promptCache,
-                cachePrefix: active.instructions,
-                onReasoning: options.onReasoning,
-                ...(turnToolChoice && { toolChoice: turnToolChoice }),
-              }
-            ),
-            abortController.signal
-          );
-        } else {
-          response = await waitForAbortable(
-            backend.chat({
-              model,
-              messages,
-              tools: registry.getSchemas(),
-              ...(turnToolChoice && { toolChoice: turnToolChoice }),
-              temperature: active.config.temperature,
-              topP: active.config.topP,
-              maxTokens: active.config.maxTokens,
-              stop: active.config.stopSequences,
-              responseFormat,
-              reasoning,
-              cache: promptCache,
-              cachePrefix: active.instructions,
+        let streamed = false;
+        const turnStream = holdsTokensForOutputFilter
+          ? turnTokens
+          : (token: string) => {
+              streamed = true;
+              turnTokens(token);
+            };
+        const onReasoning = options.onReasoning;
+        const turn = await waitForAbortable(
+          this.fallbackChain().run<ChatResponse>(
+            candidates,
+            async (candidate) => {
+              const turnMessages =
+                candidate === candidates[0]
+                  ? messages
+                  : await this.fitToModel(messages, candidate.name, active, registry);
+              const answer = normalizeTurn(
+                await (streaming
+                  ? streamChat(
+                      candidate.backend,
+                      candidate.model,
+                      turnMessages,
+                      registry,
+                      active,
+                      turnStream,
+                      abortController.signal,
+                      responseFormat,
+                      {
+                        reasoning,
+                        cache: promptCache,
+                        cachePrefix: active.instructions,
+                        ...(onReasoning && {
+                          onReasoning: (delta: string) => {
+                            streamed = true;
+                            onReasoning(delta);
+                          },
+                        }),
+                        ...(turnToolChoice && { toolChoice: turnToolChoice }),
+                      }
+                    )
+                  : candidate.backend.chat({
+                      model: candidate.model,
+                      messages: turnMessages,
+                      tools: registry.getSchemas(),
+                      ...(turnToolChoice && { toolChoice: turnToolChoice }),
+                      temperature: active.config.temperature,
+                      topP: active.config.topP,
+                      maxTokens: active.config.maxTokens,
+                      stop: active.config.stopSequences,
+                      responseFormat,
+                      reasoning,
+                      cache: promptCache,
+                      cachePrefix: active.instructions,
+                      signal: abortController.signal,
+                    }))
+              );
+              if (answer.finishReason !== 'error') return answer;
+              recordCall(answer, candidate);
+              throw llmInvalidResponse(
+                { provider: candidate.backend.provider, model: candidate.model },
+                `The model ended its turn with an error${answer.finishMessage ? `: ${answer.finishMessage}` : ''}`
+              );
+            },
+            {
               signal: abortController.signal,
-            }),
-            abortController.signal
-          );
-        }
-        response = normalizeTurn(response);
-
-        const spentBefore = costMeter.total(costModel);
-        const callModel = this.pricedModel(effectiveModel, routeProvider);
-        costMeter.add(response.usage, callModel);
-        const callCost = costMeter.total(costModel) - spentBefore;
-
-        const llmSpan = createSpan(
-          'llm.chat',
-          traceId,
-          rootSpanId,
-          llmSpanStart,
-          Date.now(),
-          {
-            'llm.model': model,
-            'llm.iteration': iterations,
-            'llm.input_tokens': response.usage.inputTokens,
-            'llm.output_tokens': response.usage.outputTokens,
-            'llm.cost': callCost,
-            ...(response.usage.cachedInputTokens && {
-              'llm.cached_input_tokens': response.usage.cachedInputTokens,
-            }),
-            ...(response.usage.reasoningTokens && {
-              'llm.reasoning_tokens': response.usage.reasoningTokens,
-            }),
-            'llm.finish_reason': response.finishReason,
-          },
-          'ok',
-          'client',
-          options.onSpan
+              canSwitch: () => !streamed,
+              onFallback: (event) => {
+                const reason = failureReason(event.error);
+                getLogger().warn('Model failed, falling back to the next model', {
+                  from: event.from,
+                  to: event.to,
+                  reason,
+                });
+                spans.push(
+                  createSpan(
+                    'llm.fallback',
+                    traceId,
+                    rootSpanId,
+                    Date.now(),
+                    Date.now(),
+                    {
+                      'llm.fallback.from': event.from,
+                      'llm.fallback.to': event.to,
+                      'llm.fallback.reason': reason,
+                    },
+                    'error',
+                    'internal',
+                    options.onSpan
+                  )
+                );
+                options.onModelFallback?.(event);
+              },
+            }
+          ),
+          abortController.signal
         );
-        spans.push(llmSpan);
-
-        totalInputTokens += response.usage.inputTokens;
-        totalOutputTokens += response.usage.outputTokens;
-        cachedInputTokens += response.usage.cachedInputTokens ?? 0;
-        cacheWriteTokens += response.usage.cacheWriteTokens ?? 0;
-        reasoningTokens += response.usage.reasoningTokens ?? 0;
+        const answeredBy = turn.candidate;
+        fellBackTo = answeredBy === candidates[0] ? undefined : answeredBy.name;
+        let response = turn.result;
+        recordCall(response, answeredBy);
         lastFinishReason = response.finishReason;
-        if (response.usage.cost === undefined) {
-          this.pricer.noteUnpriced(callModel);
-        }
-        this.state.costRouter?.recordCost({
-          runId,
-          agentId: agent.id,
-          threadId,
-          model: effectiveModel,
-          inputTokens: response.usage.inputTokens,
-          outputTokens: response.usage.outputTokens,
-          cost: callCost,
-        });
         if (response.reasoning) reasoningParts.push(response.reasoning);
-
-        if (response.finishReason === 'error') {
-          throw llmInvalidResponse(
-            { provider: backend.provider, model },
-            `The model ended its turn with an error${response.finishMessage ? `: ${response.finishMessage}` : ''}`
-          );
-        }
 
         if (
           isEmptyAnswer(response) &&
@@ -1156,7 +1231,7 @@ export class Cogitator implements ToolInvoker {
         ) {
           emptyAnswerRetries++;
           getLogger().warn('Model returned an empty answer, asking again', {
-            model,
+            model: answeredBy.model,
             iteration: iterations,
             attempt: emptyAnswerRetries,
           });
@@ -1359,7 +1434,7 @@ export class Cogitator implements ToolInvoker {
         runId,
         agentId: agent.id,
         threadId,
-        modelUsed: this.config.costRouting?.enabled ? effectiveModel : undefined,
+        modelUsed: fellBackTo ?? (this.config.costRouting?.enabled ? effectiveModel : undefined),
         usage: {
           inputTokens: totalInputTokens,
           outputTokens: totalOutputTokens,
@@ -1433,20 +1508,23 @@ export class Cogitator implements ToolInvoker {
   /**
    * The messages a new run starts with: the thread's history and the input,
    * once the input passed the injection and constitutional checks, with the
-   * input saved to memory.
+   * input saved to memory. `historyBudget` is the context builder's budget
+   * for this run, when `memory.contextBuilder.maxTokens` sets none.
    */
   private async prepareMessages(
     agent: Agent,
     options: RunOptions,
     input: string,
-    threadId: string
+    threadId: string,
+    historyBudget: number | undefined
   ): Promise<Message[]> {
     const messages = await buildInitialMessages(
       agent,
       options,
       threadId,
       this.state.memoryAdapter,
-      this.state.contextBuilder
+      this.state.contextBuilder,
+      historyBudget
     );
 
     const pii = this.config.security?.pii;
@@ -1740,6 +1818,118 @@ export class Cogitator implements ToolInvoker {
     if (this.config.costRouting?.enabled && !this.state.costRoutingInitialized) {
       initializeCostRouting(this.config, this.state, (model) => this.pricer.pricing(model));
     }
+  }
+
+  /**
+   * The context builder's budget for a run of `agent` on `modelString`, when
+   * `memory.contextBuilder.maxTokens` sets none: the model's context window,
+   * minus room for the answer (`agent.maxTokens`, else 15% of the window, at
+   * most half of it), the tool schemas and the input, and no more than the
+   * context manager lets a turn grow before it compresses. A model on Ollama
+   * gets at most the 4096 tokens Ollama serves by default, unless it runs on
+   * Ollama Cloud.
+   */
+  private historyBudget(
+    agent: Agent,
+    modelString: string,
+    explicitProvider: string | undefined,
+    registry: ToolRegistry,
+    input: string
+  ): number | undefined {
+    if (!this.state.contextBuilder || this.config.memory?.contextBuilder?.maxTokens !== undefined) {
+      return undefined;
+    }
+    const window = this.servedWindow(modelString, explicitProvider);
+    const answer = answerRoom(agent, window);
+    const fixed = countTokens(JSON.stringify(registry.getSchemas())) + countTokens(input);
+    const compressAt = this.state.contextManager?.compressionThreshold(modelString);
+    const budget = Math.floor(Math.min(window - answer, compressAt ?? Infinity) - fixed);
+    if (budget > MIN_HISTORY_BUDGET) return budget;
+    getLogger().warn(
+      'No room for conversation history: the answer, the tools and the input take the context ' +
+        'window. Set memory.contextBuilder.maxTokens, or lower the agent maxTokens.',
+      { agent: agent.name, model: modelString, window, answer, fixed }
+    );
+    return MIN_HISTORY_BUDGET;
+  }
+
+  /** The context window `modelString` runs with: its own, or Ollama's default context. */
+  private servedWindow(modelString: string, explicitProvider?: string): number {
+    const known = modelContextWindow(modelString);
+    return this.servesFullWindow(modelString, explicitProvider)
+      ? known
+      : Math.min(known, OLLAMA_DEFAULT_CONTEXT);
+  }
+
+  /**
+   * `messages` cut to what a fallback model has room for, its context window minus the answer
+   * and the tool schemas, when they are more: the system prompt and the newest messages stay,
+   * and no tool result is left without its call. A turn that falls back to a model with a
+   * smaller window than the agent's model, whose history was sized to the latter, still fits.
+   */
+  private async fitToModel(
+    messages: Message[],
+    modelString: string,
+    agent: Agent,
+    registry: ToolRegistry
+  ): Promise<Message[]> {
+    const window = this.servedWindow(modelString);
+    const room =
+      window - answerRoom(agent, window) - countTokens(JSON.stringify(registry.getSchemas()));
+    const current = countMessagesTokens(messages);
+    if (current <= room) return messages;
+    const cut = await new TruncateStrategy().compress({
+      messages,
+      targetTokens: Math.max(room, 1),
+      currentTokens: current,
+      windowSize: window,
+    });
+    return sanitizeToolHistory(cut.messages);
+  }
+
+  /**
+   * Whether `modelString` runs with its whole context window: anything but a model on Ollama,
+   * which serves a model with its default context, except Ollama Cloud (`https://ollama.com` as
+   * `llm.providers.ollama.baseUrl`, or a model tagged `cloud`).
+   */
+  private servesFullWindow(modelString: string, explicitProvider: string | undefined): boolean {
+    const { provider, model } = this.resolveRoute(modelString, explicitProvider);
+    const custom = Object.hasOwn(this.config.llm?.backends ?? {}, provider)
+      ? this.config.llm?.backends?.[provider]
+      : undefined;
+    if ((custom?.provider ?? provider) !== 'ollama' || model.endsWith('cloud')) return true;
+    if (custom) return false;
+    const baseUrl = this.config.llm?.providers?.ollama?.baseUrl;
+    return baseUrl !== undefined && isOllamaCloud(baseUrl);
+  }
+
+  /**
+   * The models a turn of `owner` runs on: its model as already routed, then its
+   * `fallbackModels`, each once. Every fallback is routed here, so a misconfigured
+   * one fails the run at its start rather than in the middle of an outage.
+   */
+  private modelCandidates(
+    owner: Agent,
+    modelString: string,
+    explicitProvider: string | undefined,
+    primary: ModelRoute
+  ): ModelCandidate[] {
+    const candidates: ModelCandidate[] = [
+      { name: this.pricedModel(modelString, explicitProvider), ...primary },
+    ];
+    for (const fallback of owner.config.fallbackModels ?? []) {
+      const [fallbackModel, fallbackProvider] =
+        typeof fallback === 'string' ? [fallback, undefined] : [fallback.model, fallback.provider];
+      const name = this.pricedModel(fallbackModel, fallbackProvider);
+      if (candidates.some((candidate) => candidate.name === name)) continue;
+      candidates.push({ name, ...this.route(fallbackModel, fallbackProvider) });
+    }
+    return candidates;
+  }
+
+  private fallbackChain(): ModelFallbackChain {
+    this.modelChain ??= new ModelFallbackChain(this.config.llm?.modelCircuitBreaker);
+    return this.modelChain;
   }
 
   private getBackend(modelString: string, explicitProvider?: string): LLMBackend {
@@ -2139,6 +2329,48 @@ function waitForAbortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<
       signal.removeEventListener('abort', onAbort);
     });
   });
+}
+
+/**
+ * The options of `resume()`: optional, unless the agent declares its deps type, whose runs must
+ * pass `deps` again (a checkpoint never holds them).
+ */
+type ResumeArgs<TDeps> = unknown extends TDeps
+  ? [options?: ResumeOptions]
+  : [options: ResumeOptions<TDeps> & { deps: TDeps }];
+
+/** The options of `invokeTool()`: optional, unless the tool reads typed `deps`. */
+type InvocationArgs<TDeps> = unknown extends TDeps
+  ? [options?: ToolInvocationOptions]
+  : [options: ToolInvocationOptions & { deps: TDeps }];
+
+/**
+ * Why a model failed, for logs and spans: its error kind or code, never the error's text, which
+ * may carry what a backend put in it.
+ */
+function failureReason(error: Error): string {
+  if (error instanceof LLMError && error.kind) return error.kind;
+  return error instanceof CogitatorError ? error.code : error.name;
+}
+
+/** The context Ollama serves a model with unless its server is told otherwise (`OLLAMA_CONTEXT_LENGTH`). */
+const OLLAMA_DEFAULT_CONTEXT = 4096;
+
+/** The smallest history budget a run hands the context builder, which keeps the instructions anyway. */
+const MIN_HISTORY_BUDGET = 256;
+
+/** Tokens of a context window kept for the answer: the agent's `maxTokens`, else 15%, at most half. */
+function answerRoom(agent: Agent, window: number): number {
+  return Math.min(agent.config.maxTokens ?? Math.floor(window * 0.15), window / 2);
+}
+
+function isOllamaCloud(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname;
+    return host === 'ollama.com' || host.endsWith('.ollama.com');
+  } catch {
+    return false;
+  }
 }
 
 interface PausedTurn {
