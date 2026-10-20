@@ -213,6 +213,7 @@ export class Cogitator implements ToolInvoker {
   private initPromise?: Promise<void>;
   private memoryInit?: Promise<void>;
   private runLimiter?: RunLimiter;
+  private warnedGuardrailsWithoutModel = false;
   private constitution?: Constitution;
 
   /**
@@ -331,7 +332,8 @@ export class Cogitator implements ToolInvoker {
    * against the tool's schema, approval asked for a call that needs it (`options.onApproval`,
    * else `guardrails.onToolApproval`), the guardrails applied, sandboxed tools run in this
    * runtime's sandbox and `tool.timeout` kept. A call that needs approval nobody gives does not
-   * run: there is no run to pause, so it is refused with the request in `pendingApproval`.
+   * run: there is no run to pause, so it is refused with the request in `pendingApproval`. A call
+   * whose `signal` aborts, even while its approval is being decided, does not run either.
    *
    * @example
    * ```ts
@@ -353,6 +355,15 @@ export class Cogitator implements ToolInvoker {
     };
     this.ensureGuardrails();
     const constitutionalAI = this.state.constitutionalAI;
+    if (!constitutionalAI) this.warnGuardrailsWithoutModel();
+    const signal = options.signal;
+    const aborted = (): ToolInvocationResult => ({
+      callId: toolCall.id,
+      name: tool.name,
+      result: null,
+      error: toAbortError(signal?.reason, `Tool "${tool.name}" aborted`).message,
+    });
+    if (signal?.aborted) return aborted();
 
     let approvedByUser = false;
     if (
@@ -366,7 +377,15 @@ export class Cogitator implements ToolInvoker {
         description: tool.description,
         ...(tool.sideEffects && { sideEffects: [...tool.sideEffects] }),
       };
-      const decision = await this.decideApproval(request, options.onApproval);
+      const deciding = this.decideApproval(request, options.onApproval);
+      let decision: Awaited<typeof deciding>;
+      try {
+        decision = await (signal ? waitForAbortable(deciding, signal) : deciding);
+      } catch (error) {
+        if (signal?.aborted) return aborted();
+        throw error;
+      }
+      if (signal?.aborted) return aborted();
       if (decision === 'pause') {
         return {
           callId: toolCall.id,
@@ -1673,6 +1692,20 @@ export class Cogitator implements ToolInvoker {
     if (this.config.context && !this.state.contextManagerInitialized) {
       initializeContextManager(this.config, this.state, (model) => this.route(model));
     }
+  }
+
+  /**
+   * Guardrails need a model, which a run takes from its agent. `invokeTool` has no agent, so
+   * without `guardrails.model` or `llm.defaultModel`, and before a run built them with its agent's
+   * model, its calls skip the guardrails: say so once.
+   */
+  private warnGuardrailsWithoutModel(): void {
+    if (this.warnedGuardrailsWithoutModel) return;
+    if (!this.config.guardrails || this.config.guardrails.enabled === false) return;
+    this.warnedGuardrailsWithoutModel = true;
+    getLogger().warn(
+      'Guardrails are enabled but tool calls made with invokeTool skip them: set guardrails.model or llm.defaultModel'
+    );
   }
 
   /**
