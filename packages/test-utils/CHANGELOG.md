@@ -1,5 +1,11 @@
 # @cogitator-ai/test-utils
 
+## 0.3.4
+
+### Patch Changes
+
+- [#209](https://github.com/cogitator-ai/Cogitator-AI/pull/209) [`bb83bdc`](https://github.com/cogitator-ai/Cogitator-AI/commit/bb83bdc6a5bfe5ec6985cd03385f0571a32218b7) Thanks [@bhushan4work](https://github.com/bhushan4work)! - Add documentation and usage examples in README.md
+
 ## 0.3.3
 
 ### Patch Changes
