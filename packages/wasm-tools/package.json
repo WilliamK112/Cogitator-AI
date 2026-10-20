@@ -1,6 +1,6 @@
 {
   "name": "@cogitator-ai/wasm-tools",
-  "version": "0.7.23",
+  "version": "0.7.24",
   "description": "WASM-based tools for Cogitator agents",
   "keywords": [
     "cogitator",
