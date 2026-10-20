@@ -1,5 +1,21 @@
 # @cogitator-ai/channels
 
+## 0.12.0
+
+### Minor Changes
+
+- [#207](https://github.com/cogitator-ai/Cogitator-AI/pull/207) [`b5c11eb`](https://github.com/cogitator-ai/Cogitator-AI/commit/b5c11eb5368f52169273527c2ea6f16e83ab8b22) - `mcpServers.<name>.requiresApproval` in the assistant config decides which tools of an MCP server ask approval in chat before they run: `true` for every call, `false` for none. Without it the tools the server marks destructive ask, as `getTools()` of `@cogitator-ai/mcp` now does by default.
+
+### Patch Changes
+
+- Updated dependencies [[`b5c11eb`](https://github.com/cogitator-ai/Cogitator-AI/commit/b5c11eb5368f52169273527c2ea6f16e83ab8b22)]:
+  - @cogitator-ai/types@0.44.0
+  - @cogitator-ai/core@0.42.0
+  - @cogitator-ai/mcp@19.5.0
+  - @cogitator-ai/browser@0.4.19
+  - @cogitator-ai/memory@0.12.9
+  - @cogitator-ai/rag@0.7.4
+
 ## 0.11.4
 
 ### Patch Changes
