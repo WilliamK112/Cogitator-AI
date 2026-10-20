@@ -1,5 +1,11 @@
 # @cogitator-ai/mcp
 
+## 19.5.2
+
+### Patch Changes
+
+- [#214](https://github.com/cogitator-ai/Cogitator-AI/pull/214) [`f903fc1`](https://github.com/cogitator-ai/Cogitator-AI/commit/f903fc15fca7e29f5187f1fc60e099a8a9b28a03) - Require `@modelcontextprotocol/sdk` 1.32.1 or later. Earlier versions did not tie experimental tasks to the session that created them, and their HTTP client transports and OAuth requests followed cross-origin redirects while re-sending custom headers and request bodies.
+
 ## 19.5.1
 
 ### Patch Changes

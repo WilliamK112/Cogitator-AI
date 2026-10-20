@@ -1,5 +1,11 @@
 # create-cogitator-app
 
+## 0.8.5
+
+### Patch Changes
+
+- [#214](https://github.com/cogitator-ai/Cogitator-AI/pull/214) [`f903fc1`](https://github.com/cogitator-ai/Cogitator-AI/commit/f903fc15fca7e29f5187f1fc60e099a8a9b28a03) - Require `tar` 7.5.22 or later. Earlier versions are open to hardlink and symlink path traversal and to several denial of service bugs, and the scaffolder extracts template archives downloaded from GitHub.
+
 ## 0.8.4
 
 ### Patch Changes

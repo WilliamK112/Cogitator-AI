@@ -1,5 +1,13 @@
 # @cogitator-ai/cli
 
+## 0.8.5
+
+### Patch Changes
+
+- Updated dependencies [[`f903fc1`](https://github.com/cogitator-ai/Cogitator-AI/commit/f903fc15fca7e29f5187f1fc60e099a8a9b28a03), [`f903fc1`](https://github.com/cogitator-ai/Cogitator-AI/commit/f903fc15fca7e29f5187f1fc60e099a8a9b28a03)]:
+  - @cogitator-ai/mcp@19.5.2
+  - create-cogitator-app@0.8.5
+
 ## 0.8.4
 
 ### Patch Changes
