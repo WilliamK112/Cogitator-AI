@@ -1,5 +1,11 @@
 # @cogitator-ai/wasm-tools
 
+## 0.8.0
+
+### Minor Changes
+
+- [#211](https://github.com/cogitator-ai/Cogitator-AI/pull/211) [`80ef037`](https://github.com/cogitator-ai/Cogitator-AI/commit/80ef03765a7d42082dac2fe7c9ee01e80040fc16) Thanks [@CG-5228](https://github.com/CG-5228)! - Add `units` WASM tool (`createUnitsTool`, `unitsToolSchema`) for deterministic unit conversions across length, mass, temperature, volume, speed, and data size categories.
+
 ## 0.7.25
 
 ### Patch Changes
