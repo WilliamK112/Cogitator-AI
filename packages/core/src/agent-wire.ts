@@ -16,6 +16,7 @@ import type {
   ToolSchema,
 } from '@cogitator-ai/types';
 import { Agent, MAX_FALLBACK_MODELS } from './agent';
+import { getLogger } from './logger';
 
 /**
  * How each `AgentConfig` field travels in the agent wire format. Adding a field to
@@ -42,6 +43,7 @@ export const AGENT_CONFIG_WIRE_FIELDS = {
   maxIterations: 'carried',
   onIterationLimit: 'carried',
   timeout: 'carried',
+  middleware: 'not carried: it is code, the receiving side runs its own (config middleware)',
 } as const satisfies Record<keyof AgentConfig, string>;
 
 /** Something wrong with an agent on the wire, or with what the receiving side can run. */
@@ -223,8 +225,18 @@ export function fromAgentWireResponseFormat(
   return { type: 'json_schema', schema: z.fromJSONSchema(format.schema) };
 }
 
+/** Agents `toAgentWire` already warned about: one warning per agent, not one per job. */
+const warnedMiddleware = new WeakSet<IAgent>();
+
 function agentToWire(agent: IAgent, options: ToAgentWireOptions): AgentWireAgent {
   const { config } = agent;
+  if (config.middleware?.length && !warnedMiddleware.has(agent)) {
+    warnedMiddleware.add(agent);
+    getLogger().warn(
+      'The agent wire format does not carry middleware: the receiving side runs the agent with its own',
+      { agent: agent.name, middleware: config.middleware.map((layer) => layer.name) }
+    );
+  }
   const model = config.model || options.resolveModel?.(agent);
   if (!model) {
     throw new AgentWireError(

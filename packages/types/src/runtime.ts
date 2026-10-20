@@ -23,6 +23,7 @@ import type { PiiConfig, PromptInjectionConfig } from './security';
 import type { DeployConfig } from './deploy';
 import type { DecisionBackend } from './decision';
 import type { ContextManagerConfig } from './context';
+import type { RunMiddleware } from './middleware';
 import type { LoggingConfig } from './logging';
 import type { ABTestStore, ABTestVariant, InstructionVersionStore } from './prompt-optimization';
 
@@ -107,6 +108,12 @@ export interface CogitatorConfig {
    * `LangfuseExporter` give one with `observer()`.
    */
   observers?: RunObserver[];
+  /**
+   * Hooks around the model and tool calls of every run of this runtime, outermost, before the
+   * agent's and the run's own (see `RunMiddleware`). Their `wrapToolCall` also wraps tool
+   * calls made with `invokeTool()`.
+   */
+  middleware?: RunMiddleware[];
   /**
    * Versioned instructions and A/B tests. Runs of an agent with a deployed
    * version use its instructions; while an A/B test runs, each thread gets
@@ -254,6 +261,12 @@ export interface RunOptions<TDeps = unknown> {
   parallelToolCalls?: boolean;
 
   /**
+   * Hooks around this run's model and tool calls, after the Cogitator's and the agent's
+   * middleware (see `RunMiddleware`). Pass them again to `resume()`.
+   */
+  middleware?: RunMiddleware<TDeps>[];
+
+  /**
    * The user the run acts for. It owns the threads the run creates, scopes the
    * facts and embeddings put into the context, and reaches tools as `context.userId`.
    */
@@ -360,7 +373,11 @@ export interface ToolInvocationResult extends ToolResult {
  * outside a run (an MCP server, a self-modifying agent) takes it to honor all of that.
  */
 export interface ToolInvoker {
-  /** Never throws for a failing tool: the error is in the result's `error` */
+  /**
+   * Never throws for a failing tool: the error is in the result's `error`. An error a
+   * `wrapToolCall` middleware of the Cogitator throws, and a `tripwire()` raised in the tool
+   * itself (a nested agent run), are thrown, as they would fail a run.
+   */
   invokeTool(
     tool: Tool,
     args: unknown,
