@@ -1,5 +1,13 @@
 # @cogitator-ai/self-modifying
 
+## 19.4.7
+
+### Patch Changes
+
+- Updated dependencies [[`06ea6ec`](https://github.com/cogitator-ai/Cogitator-AI/commit/06ea6ec3eb96b4530d5f90f255c2e3abe630dfbd), [`06ea6ec`](https://github.com/cogitator-ai/Cogitator-AI/commit/06ea6ec3eb96b4530d5f90f255c2e3abe630dfbd), [`06ea6ec`](https://github.com/cogitator-ai/Cogitator-AI/commit/06ea6ec3eb96b4530d5f90f255c2e3abe630dfbd), [`06ea6ec`](https://github.com/cogitator-ai/Cogitator-AI/commit/06ea6ec3eb96b4530d5f90f255c2e3abe630dfbd)]:
+  - @cogitator-ai/types@0.42.0
+  - @cogitator-ai/core@0.40.0
+
 ## 19.4.6
 
 ### Patch Changes
