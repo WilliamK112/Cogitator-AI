@@ -6,6 +6,7 @@
 
 export {
   BaseMemoryAdapter,
+  ChangeReportingMemoryAdapter,
   InMemoryAdapter,
   createMemoryAdapter,
   createEmbeddingAdapter,
@@ -40,6 +41,13 @@ export {
   type ContextBuilderDeps,
   type BuildContextOptions,
 } from './context-builder';
+
+export {
+  MessageIndex,
+  indexedText,
+  type MessageIndexOptions,
+  type IndexedText,
+} from './message-index';
 
 export {
   countTokens,

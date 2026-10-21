@@ -28,13 +28,18 @@ import type {
   NewMemoryEntry,
   EmbeddingDeleteFilter,
 } from '@cogitator-ai/types';
-import { BaseMemoryAdapter } from './base';
-import { EMPTY_DELETE_FILTER_ERROR, hasDeleteCondition } from '../search/filter';
+import { ChangeReportingMemoryAdapter } from './base';
+import { attempt, ensureSchemaVersion, withSetupTransaction } from './schema-version';
+import { EMPTY_DELETE_FILTER_ERROR, filterSourceTypes, hasDeleteCondition } from '../search/filter';
 import {
   detectVectorSearchTuning,
   ensureHnswCosineIndex,
   hnswSearchSettings,
+  MAX_HALFVEC_INDEX_DIMENSIONS,
+  MAX_VECTOR_INDEX_DIMENSIONS,
+  vectorColumnPlan,
   type SqlQueryable,
+  type VectorColumnPlan,
   type VectorSearchTuning,
 } from './pgvector';
 import { threadListing, threadPage, type ThreadListing } from './thread-listing';
@@ -65,13 +70,38 @@ export type VectorStoreState =
  */
 const THREAD_TIME = "date_trunc('milliseconds', updated_at AT TIME ZONE 'UTC')";
 
+/**
+ * Layout of threads, entries and facts. 1: the tables with `entries.seq` and the listing
+ * indexes; a schema from before versions were recorded is brought up to it in place.
+ */
+const MEMORY_SCHEMA_VERSION = 1;
+
+/** An `embeddings` row as an embedding, its vector read from pgvector's text form when needed */
+function rowToEmbedding(row: Record<string, unknown>): Embedding {
+  return {
+    id: row.id as string,
+    sourceId: row.source_id as string,
+    sourceType: row.source_type as Embedding['sourceType'],
+    vector:
+      typeof row.vector === 'string'
+        ? row.vector
+            .replace(/^\[|\]$/g, '')
+            .split(',')
+            .map(Number)
+        : (row.vector as number[]),
+    content: row.content as string,
+    metadata: row.metadata as Record<string, unknown>,
+    createdAt: new Date(row.created_at as string),
+  };
+}
+
 /** JSON text for a JSONB parameter. node-pg would send a JS array as a Postgres array literal. */
 function toJsonb(value: unknown): string | null {
   return value === undefined || value === null ? null : JSON.stringify(value);
 }
 
 export class PostgresAdapter
-  extends BaseMemoryAdapter
+  extends ChangeReportingMemoryAdapter
   implements FactAdapter, EmbeddingAdapter, KeywordSearchAdapter
 {
   readonly provider: MemoryProvider = 'postgres';
@@ -81,7 +111,8 @@ export class PostgresAdapter
   private schema: string;
   private vectorDimensions = DEFAULT_VECTOR_DIMENSIONS;
   private dimensionsConfigured = false;
-  private vectorTuning: VectorSearchTuning = { iterativeScan: false };
+  private vectorTuning: VectorSearchTuning = { iterativeScan: false, halfvec: false };
+  private vectorPlan: VectorColumnPlan = vectorColumnPlan('vector', 0, { halfvec: false });
   private vectorStore: VectorStoreState = { available: false, reason: 'Not connected' };
 
   constructor(config: PostgresAdapterConfig) {
@@ -143,82 +174,105 @@ export class PostgresAdapter
     return this.vectorStore;
   }
 
+  /**
+   * Sets the schema up in one transaction under a lock on the schema, so processes starting at
+   * once take turns instead of racing on the same `CREATE`. Steps that may fail without failing
+   * the setup (pgvector, the vector and keyword indexes) run in savepoints.
+   */
   private async initSchema(pool: Pool): Promise<void> {
-    await pool.query(`CREATE SCHEMA IF NOT EXISTS ${this.schema}`);
+    this.vectorStore = await withSetupTransaction(pool, `${this.schema}.setup`, async (db) => {
+      await db.query(`CREATE SCHEMA IF NOT EXISTS ${this.schema}`);
+      const extensionError = await attempt(db, () =>
+        db.query('CREATE EXTENSION IF NOT EXISTS vector')
+      );
+      await this.migrate(db);
+      return this.prepareVectorStore(db, extensionError?.message);
+    });
+  }
 
-    let extensionError: string | undefined;
-    try {
-      await pool.query('CREATE EXTENSION IF NOT EXISTS vector');
-    } catch (err) {
-      extensionError = (err as Error).message;
-    }
+  /** Brings threads, entries and facts to {@link MEMORY_SCHEMA_VERSION} */
+  private async migrate(connection: SqlQueryable): Promise<void> {
+    const tables = ['threads', 'entries', 'facts'].map((table) => `${this.schema}.${table}`);
+    const present = async (db: SqlQueryable) => {
+      const found = await db.query(
+        'SELECT count(*)::int AS n FROM unnest($1::text[]) AS t(name) WHERE to_regclass(name) IS NOT NULL',
+        [tables]
+      );
+      return found.rows[0]?.n === tables.length;
+    };
+    await ensureSchemaVersion(
+      connection,
+      this.schema,
+      'memory',
+      MEMORY_SCHEMA_VERSION,
+      async (db) => {
+        await db.query(`
+        CREATE TABLE IF NOT EXISTS ${this.schema}.threads (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          metadata JSONB DEFAULT '{}',
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+      `);
 
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ${this.schema}.threads (
-        id TEXT PRIMARY KEY,
-        agent_id TEXT NOT NULL,
-        metadata JSONB DEFAULT '{}',
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
+        await db.query(`
+        CREATE TABLE IF NOT EXISTS ${this.schema}.entries (
+          id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL REFERENCES ${this.schema}.threads(id) ON DELETE CASCADE,
+          message JSONB NOT NULL,
+          tool_calls JSONB,
+          tool_results JSONB,
+          token_count INTEGER NOT NULL,
+          metadata JSONB DEFAULT '{}',
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+      `);
 
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ${this.schema}.entries (
-        id TEXT PRIMARY KEY,
-        thread_id TEXT NOT NULL REFERENCES ${this.schema}.threads(id) ON DELETE CASCADE,
-        message JSONB NOT NULL,
-        tool_calls JSONB,
-        tool_results JSONB,
-        token_count INTEGER NOT NULL,
-        metadata JSONB DEFAULT '{}',
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
+        await db.query(`
+        CREATE TABLE IF NOT EXISTS ${this.schema}.facts (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          content TEXT NOT NULL,
+          category TEXT NOT NULL,
+          confidence REAL DEFAULT 1.0,
+          source TEXT NOT NULL,
+          metadata JSONB DEFAULT '{}',
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          expires_at TIMESTAMPTZ
+        )
+      `);
 
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ${this.schema}.facts (
-        id TEXT PRIMARY KEY,
-        agent_id TEXT NOT NULL,
-        content TEXT NOT NULL,
-        category TEXT NOT NULL,
-        confidence REAL DEFAULT 1.0,
-        source TEXT NOT NULL,
-        metadata JSONB DEFAULT '{}',
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
-        expires_at TIMESTAMPTZ
-      )
-    `);
+        await db.query(`CREATE SEQUENCE IF NOT EXISTS ${this.schema}.entries_seq`);
+        await db.query(`ALTER TABLE ${this.schema}.entries ADD COLUMN IF NOT EXISTS seq BIGINT`);
+        await db.query(
+          `ALTER TABLE ${this.schema}.entries ALTER COLUMN seq SET DEFAULT nextval('${this.schema}.entries_seq')`
+        );
 
-    await pool.query(`CREATE SEQUENCE IF NOT EXISTS ${this.schema}.entries_seq`);
-    await pool.query(`ALTER TABLE ${this.schema}.entries ADD COLUMN IF NOT EXISTS seq BIGINT`);
-    await pool.query(
-      `ALTER TABLE ${this.schema}.entries ALTER COLUMN seq SET DEFAULT nextval('${this.schema}.entries_seq')`
+        await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_entries_thread_id
+        ON ${this.schema}.entries(thread_id, created_at)
+      `);
+        await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_threads_agent_updated
+        ON ${this.schema}.threads(agent_id, (${THREAD_TIME}), (id COLLATE "C"))
+      `);
+        await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_threads_updated
+        ON ${this.schema}.threads((${THREAD_TIME}), (id COLLATE "C"))
+      `);
+        await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_threads_metadata
+        ON ${this.schema}.threads USING GIN (metadata jsonb_path_ops)
+      `);
+        await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_facts_agent_id
+        ON ${this.schema}.facts(agent_id, category)
+      `);
+      },
+      present
     );
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_entries_thread_id
-      ON ${this.schema}.entries(thread_id, created_at)
-    `);
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_threads_agent_updated
-      ON ${this.schema}.threads(agent_id, (${THREAD_TIME}), (id COLLATE "C"))
-    `);
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_threads_updated
-      ON ${this.schema}.threads((${THREAD_TIME}), (id COLLATE "C"))
-    `);
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_threads_metadata
-      ON ${this.schema}.threads USING GIN (metadata jsonb_path_ops)
-    `);
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_facts_agent_id
-      ON ${this.schema}.facts(agent_id, category)
-    `);
-
-    this.vectorStore = await this.prepareVectorStore(pool, extensionError);
   }
 
   /**
@@ -228,7 +282,7 @@ export class PostgresAdapter
    * table is migrated.
    */
   private async prepareVectorStore(
-    pool: Pool,
+    pool: SqlQueryable,
     extensionError: string | undefined
   ): Promise<VectorStoreState> {
     const type = await pool.query("SELECT to_regtype('vector') IS NOT NULL AS available");
@@ -271,19 +325,39 @@ export class PostgresAdapter
       this.vectorDimensions = existing;
     }
 
-    try {
-      await ensureHnswCosineIndex(pool, {
-        schema: this.schema,
-        table: 'embeddings',
-        column: 'vector',
-        index: 'idx_embeddings_vector',
-      });
-      this.vectorTuning = await detectVectorSearchTuning(pool);
-    } catch (err) {
-      console.warn('Failed to create the HNSW vector index:', (err as Error).message);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_embeddings_source ON ${this.schema}.embeddings(source_id)`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_embeddings_thread ON ${this.schema}.embeddings((metadata->>'threadId'))`
+    );
+
+    this.vectorTuning = await detectVectorSearchTuning(pool);
+    this.vectorPlan = vectorColumnPlan('vector', this.vectorDimensions, this.vectorTuning);
+    const indexError = await attempt(pool, async () => {
+      this.vectorPlan = await ensureHnswCosineIndex(
+        pool,
+        {
+          schema: this.schema,
+          table: 'embeddings',
+          column: 'vector',
+          index: 'idx_embeddings_vector',
+          dimensions: this.vectorDimensions,
+        },
+        this.vectorTuning
+      );
+    });
+    if (indexError) console.warn('Failed to create the HNSW vector index:', indexError.message);
+    if (!this.vectorPlan.opclass) {
+      console.warn(
+        `PostgresAdapter: ${this.vectorDimensions}-dimension embeddings have no vector index ` +
+          `(pgvector indexes up to ${MAX_VECTOR_INDEX_DIMENSIONS}, or ` +
+          `${MAX_HALFVEC_INDEX_DIMENSIONS} as halfvec from pgvector 0.7), so searches scan ` +
+          'every row'
+      );
     }
 
-    try {
+    const keywordError = await attempt(pool, async () => {
       await pool.query(`
         ALTER TABLE ${this.schema}.embeddings
         ADD COLUMN IF NOT EXISTS content_tsv tsvector
@@ -293,9 +367,8 @@ export class PostgresAdapter
         CREATE INDEX IF NOT EXISTS idx_embeddings_tsv
         ON ${this.schema}.embeddings USING GIN (content_tsv)
       `);
-    } catch (err) {
-      console.warn('Failed to create tsvector column/index:', (err as Error).message);
-    }
+    });
+    if (keywordError) console.warn('Failed to create tsvector column/index:', keywordError.message);
 
     return { available: true, dimensions: this.vectorDimensions };
   }
@@ -304,7 +377,7 @@ export class PostgresAdapter
    * The vector size of the existing `embeddings.vector` column: null without the table, 0 for a
    * column declared without a size.
    */
-  private async embeddingColumnDimensions(pool: Pool): Promise<number | null> {
+  private async embeddingColumnDimensions(pool: SqlQueryable): Promise<number | null> {
     const result = await pool.query(
       `SELECT a.atttypmod AS dimensions
        FROM pg_attribute a
@@ -468,6 +541,13 @@ export class PostgresAdapter
   }
 
   async deleteThread(threadId: string): Promise<MemoryResult<void>> {
+    return this.reported(await this.dropThread(threadId), () => ({
+      type: 'thread-deleted',
+      threadId,
+    }));
+  }
+
+  private async dropThread(threadId: string): Promise<MemoryResult<void>> {
     if (!this.pool) return this.failure('Not connected');
     try {
       await this.pool.query(`DELETE FROM ${this.schema}.threads WHERE id = $1`, [threadId]);
@@ -478,6 +558,13 @@ export class PostgresAdapter
   }
 
   async addEntry(entry: NewMemoryEntry): Promise<MemoryResult<MemoryEntry>> {
+    return this.reported(await this.storeEntry(entry), (stored) => ({
+      type: 'entry-added',
+      entry: stored,
+    }));
+  }
+
+  private async storeEntry(entry: NewMemoryEntry): Promise<MemoryResult<MemoryEntry>> {
     if (!this.pool) return this.failure('Not connected');
 
     const id = this.generateId('entry');
@@ -562,6 +649,13 @@ export class PostgresAdapter
   }
 
   async deleteEntry(entryId: string): Promise<MemoryResult<void>> {
+    return this.reported(await this.removeEntry(entryId), () => ({
+      type: 'entry-deleted',
+      entryId,
+    }));
+  }
+
+  private async removeEntry(entryId: string): Promise<MemoryResult<void>> {
     if (!this.pool) return this.failure('Not connected');
     try {
       await this.pool.query(`DELETE FROM ${this.schema}.entries WHERE id = $1`, [entryId]);
@@ -572,6 +666,13 @@ export class PostgresAdapter
   }
 
   async clearThread(threadId: string): Promise<MemoryResult<void>> {
+    return this.reported(await this.emptyThread(threadId), () => ({
+      type: 'thread-cleared',
+      threadId,
+    }));
+  }
+
+  private async emptyThread(threadId: string): Promise<MemoryResult<void>> {
     if (!this.pool) return this.failure('Not connected');
     try {
       await this.pool.query(`DELETE FROM ${this.schema}.entries WHERE thread_id = $1`, [threadId]);
@@ -785,6 +886,44 @@ export class PostgresAdapter
     }
   }
 
+  async replaceBySource(
+    embedding: Omit<Embedding, 'id' | 'createdAt'>
+  ): Promise<MemoryResult<Embedding>> {
+    if (!this.pool) return this.failure('Not connected');
+    const unavailable = this.vectorUnavailable();
+    if (unavailable) return unavailable;
+
+    const id = this.generateId('emb');
+    const now = new Date();
+    try {
+      await this.inTransaction(async (client) => {
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+          `${this.schema}.embeddings:${embedding.sourceId}`,
+        ]);
+        await client.query(`DELETE FROM ${this.schema}.embeddings WHERE source_id = $1`, [
+          embedding.sourceId,
+        ]);
+        await client.query(
+          `INSERT INTO ${this.schema}.embeddings
+           (id, source_id, source_type, vector, content, metadata, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
+          [
+            id,
+            embedding.sourceId,
+            embedding.sourceType,
+            `[${embedding.vector.join(',')}]`,
+            embedding.content,
+            toJsonb(embedding.metadata ?? {}),
+            now,
+          ]
+        );
+      });
+      return this.success({ ...embedding, id, createdAt: now });
+    } catch (err) {
+      return this.failure((err as Error).message);
+    }
+  }
+
   async search(
     options: SemanticSearchOptions
   ): Promise<MemoryResult<(Embedding & { score: number })[]>> {
@@ -808,12 +947,13 @@ export class PostgresAdapter
     params.push(settings.candidates, limit);
     const candidatesParam = filter.nextIndex;
     const limitParam = filter.nextIndex + 1;
+    const distance = this.vectorPlan.distance('$1');
     const query = `
       SELECT * FROM (
-        SELECT *, 1 - (vector <=> $1) as score
+        SELECT *, 1 - (${distance}) as score
         FROM ${this.schema}.embeddings
-        WHERE 1 - (vector <=> $1) >= $2${filter.sql}
-        ORDER BY vector <=> $1
+        WHERE 1 - (${distance}) >= $2${filter.sql}
+        ORDER BY ${distance}
         LIMIT $${candidatesParam}
       ) nearest
       ORDER BY score DESC, id
@@ -831,23 +971,24 @@ export class PostgresAdapter
     }
 
     return this.success(
-      result.rows.map((row) => ({
-        id: row.id as string,
-        sourceId: row.source_id as string,
-        sourceType: row.source_type as Embedding['sourceType'],
-        vector:
-          typeof row.vector === 'string'
-            ? (row.vector as string)
-                .replace(/^\[|\]$/g, '')
-                .split(',')
-                .map(Number)
-            : (row.vector as number[]),
-        content: row.content as string,
-        metadata: row.metadata as Record<string, unknown>,
-        createdAt: new Date(row.created_at as string),
-        score: row.score as number,
-      }))
+      result.rows.map((row) => ({ ...rowToEmbedding(row), score: row.score as number }))
     );
+  }
+
+  async getBySources(sourceIds: string[]): Promise<MemoryResult<Embedding[]>> {
+    if (!this.pool) return this.failure('Not connected');
+    const unavailable = this.embeddingTableUnavailable();
+    if (unavailable) return unavailable;
+    if (sourceIds.length === 0) return this.success([]);
+    try {
+      const result = await this.pool.query(
+        `SELECT * FROM ${this.schema}.embeddings WHERE source_id = ANY($1::text[])`,
+        [sourceIds]
+      );
+      return this.success(result.rows.map(rowToEmbedding));
+    } catch (err) {
+      return this.failure((err as Error).message);
+    }
   }
 
   async deleteEmbedding(embeddingId: string): Promise<MemoryResult<void>> {
@@ -951,9 +1092,10 @@ export class PostgresAdapter
   ): { sql: string; nextIndex: number } {
     let sql = '';
     let index = startIndex;
-    if (filter?.sourceType) {
-      sql += ` AND source_type = $${index++}`;
-      params.push(filter.sourceType);
+    const types = filterSourceTypes(filter);
+    if (types) {
+      sql += ` AND source_type = ANY($${index++}::text[])`;
+      params.push(types);
     }
     if (filter?.agentId) {
       sql += ` AND metadata->>'agentId' = $${index++}`;

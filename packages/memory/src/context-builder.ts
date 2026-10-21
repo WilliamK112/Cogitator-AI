@@ -23,6 +23,7 @@ import type {
 } from '@cogitator-ai/types';
 import type { GraphContextBuilder } from './knowledge-graph/graph-context-builder';
 import { countEntryTokens, countMessageTokens, countTokens } from './token-counter';
+import { indexedText, type IndexedText, type MessageIndex } from './message-index';
 
 const SEMANTIC_RESULTS = 5;
 
@@ -34,6 +35,12 @@ const MAX_SCORED_ENTRIES = 200;
 
 /** History entry vectors kept per builder, so an entry is embedded once rather than every turn. */
 const ENTRY_VECTOR_CACHE_SIZE = 4096;
+
+/** Entries older than the scored window a `messageIndex` search may bring back */
+const INDEX_SEARCH_RESULTS = 50;
+
+/** What semantic context searches: facts and documents, never the vectors of messages */
+const SEMANTIC_SOURCES: Embedding['sourceType'][] = ['fact', 'document'];
 
 /** The value of a memory operation, or an error naming the operation that failed. */
 function unwrap<T>(result: MemoryResult<T>, operation: string): T {
@@ -66,6 +73,12 @@ export interface ContextBuilderDeps {
   embeddingAdapter?: EmbeddingAdapter;
   embeddingService?: EmbeddingService;
   graphContextBuilder?: GraphContextBuilder;
+  /**
+   * Vectors of history entries kept in an embedding store. With it `relevant` and `hybrid`
+   * embed only the input and the entries not indexed yet, and find older entries of the thread
+   * by a search of the store. Without it the builder keeps vectors in process.
+   */
+  messageIndex?: MessageIndex;
 }
 
 export interface BuildContextOptions {
@@ -84,6 +97,12 @@ export interface BuildContextOptions {
 
 type ResolvedConfig = Required<Omit<ContextBuilderConfig, 'maxTokens' | 'reserveTokens'>> &
   Pick<ContextBuilderConfig, 'maxTokens' | 'reserveTokens'>;
+
+/** What scoring knows of the build: the index mark taken before the read, and the thread size */
+interface ScoringScope {
+  mark?: number;
+  threadSize: number;
+}
 
 /** Part of a context: what fits its budget, and what does not. */
 interface Fitted<T> {
@@ -195,6 +214,7 @@ export class ContextBuilder {
       systemBlocks.length > 0 ? [{ role: 'system', content: systemBlocks.join('\n\n') }] : [];
     const injectedSystemMessages = messages.length;
 
+    const scope: ScoringScope = { mark: this.deps.messageIndex?.mark(), threadSize: 0 };
     const entries =
       (await this.attempt('history', errors, async () =>
         unwrap(
@@ -206,11 +226,13 @@ export class ContextBuilder {
         )
       )) ?? [];
 
+    scope.threadSize = entries.length;
     const selectedEntries = await this.selectEntries(
       entries,
       remaining(),
       options.currentInput,
-      errors
+      errors,
+      scope
     );
     for (const entry of selectedEntries) {
       messages.push(entry.message);
@@ -303,7 +325,10 @@ export class ContextBuilder {
         vector,
         limit: SEMANTIC_RESULTS * 4,
         threshold: 0.7,
-        ...(options.userId !== undefined && { filter: { userId: options.userId } }),
+        filter: {
+          sourceTypes: SEMANTIC_SOURCES,
+          ...(options.userId !== undefined && { userId: options.userId }),
+        },
       }),
       'search'
     );
@@ -311,7 +336,11 @@ export class ContextBuilder {
     const fitted: Fitted<Embedding & { score: number }> = { kept: [], dropped: [] };
     let tokens = 0;
     for (const result of found
-      .filter((r) => isVisibleTo(r.metadata, options.agentId, options.userId))
+      .filter(
+        (r) =>
+          SEMANTIC_SOURCES.includes(r.sourceType) &&
+          isVisibleTo(r.metadata, options.agentId, options.userId)
+      )
       .slice(0, SEMANTIC_RESULTS)) {
       const resultTokens = countTokens(result.content);
       if (tokens + resultTokens <= budget) {
@@ -365,13 +394,14 @@ export class ContextBuilder {
     entries: MemoryEntry[],
     availableTokens: number,
     currentInput: string | undefined,
-    errors: ContextBuildError[]
+    errors: ContextBuildError[],
+    scope: ScoringScope
   ): Promise<MemoryEntry[]> | MemoryEntry[] {
     switch (this.config.strategy) {
       case 'relevant':
-        return this.selectRelevantEntries(entries, availableTokens, currentInput, errors);
+        return this.selectRelevantEntries(entries, availableTokens, currentInput, errors, scope);
       case 'hybrid':
-        return this.selectHybridEntries(entries, availableTokens, currentInput, errors);
+        return this.selectHybridEntries(entries, availableTokens, currentInput, errors, scope);
       case 'recent':
       default:
         return this.selectRecentEntries(entries, availableTokens);
@@ -404,13 +434,14 @@ export class ContextBuilder {
     entries: MemoryEntry[],
     availableTokens: number,
     currentInput: string | undefined,
-    errors: ContextBuildError[]
+    errors: ContextBuildError[],
+    scope: ScoringScope
   ): Promise<MemoryEntry[]> {
     if (!currentInput || !this.deps.embeddingService) {
       return this.selectRecentEntries(entries, availableTokens);
     }
 
-    const scored = await this.scoreEntries(entries, currentInput, 0, errors);
+    const scored = await this.scoreEntries(entries, currentInput, 0, errors, scope);
     if (scored === null) {
       return this.selectRecentEntries(entries, availableTokens);
     }
@@ -429,51 +460,90 @@ export class ContextBuilder {
   }
 
   /**
-   * Similarity of the newest {@link MAX_SCORED_ENTRIES} user/assistant text entries to the
-   * input, best first. Each entry is embedded once: its vector is kept by entry id, so a turn
-   * only embeds the input and the entries added since the last build. Returns null, recording a
-   * `relevance` error, when embedding fails.
+   * Similarity of user/assistant text entries to the input, best first. The newest
+   * {@link MAX_SCORED_ENTRIES} are scored against their vectors, each embedded once: kept in the
+   * `messageIndex` when there is one, else by entry id in process. With a `messageIndex`, older
+   * entries the store finds close to the input are scored too. When the index fails, the newest
+   * entries are scored with vectors kept in process and the failure is recorded as a `relevance`
+   * error. Returns null, recording one, when embedding fails.
    */
   private async scoreEntries(
     entries: MemoryEntry[],
     input: string,
     minScore: number,
-    errors: ContextBuildError[]
+    errors: ContextBuildError[],
+    scope: ScoringScope
   ): Promise<{ entry: MemoryEntry; score: number }[] | null> {
     const embeddingService = this.deps.embeddingService;
     if (!embeddingService) return null;
 
-    const embeddable: { entry: MemoryEntry; text: string }[] = [];
+    const embeddable: { entry: MemoryEntry; text: IndexedText }[] = [];
     for (const entry of entries) {
-      if (entry.message.role !== 'user' && entry.message.role !== 'assistant') continue;
-      const content = entry.message.content;
-      if (typeof content === 'string' && content.trim().length > 0) {
-        embeddable.push({ entry, text: content });
-      }
+      const text = indexedText(entry);
+      if (text) embeddable.push({ entry, text });
     }
     const candidates = embeddable.slice(-MAX_SCORED_ENTRIES);
     if (candidates.length === 0) return [];
-
-    const missing = candidates.filter(({ entry }) => !this.entryVectors.has(entry.id));
+    const older = embeddable.slice(0, embeddable.length - candidates.length);
+    const index = this.deps.messageIndex;
+    const threadId = candidates[0]!.entry.threadId;
+    if (index && older.length > 0) {
+      index.backfill(
+        threadId,
+        older.map(({ text }) => text),
+        scope.mark
+      );
+    }
 
     try {
-      const [inputVector, vectors] = await Promise.all([
+      const texts = candidates.map(({ text }) => text);
+      const windowVectors = async (): Promise<{
+        vectors: Map<string, Float32Array>;
+        indexed: boolean;
+      }> => {
+        if (!index) return { vectors: await this.processVectors(texts), indexed: false };
+        try {
+          return { vectors: await index.vectorsOf(texts, scope.mark), indexed: true };
+        } catch (err) {
+          errors.push({
+            source: 'relevance',
+            error: err instanceof Error ? err : new Error(String(err)),
+          });
+          return { vectors: await this.processVectors(texts), indexed: false };
+        }
+      };
+      const [inputVector, { vectors, indexed }] = await Promise.all([
         embeddingService.embed(input),
-        missing.length > 0 ? embeddingService.embedBatch(missing.map((e) => e.text)) : [],
+        windowVectors(),
       ]);
-      if (vectors.length !== missing.length) {
-        throw new Error(
-          `Embedding returned ${vectors.length} vectors for ${missing.length} history entries`
-        );
-      }
-      missing.forEach(({ entry }, i) => this.rememberVector(entry.id, vectors[i]));
+      index?.offer(input, inputVector);
 
       const scored: { entry: MemoryEntry; score: number }[] = [];
       for (const { entry } of candidates) {
-        const vector = this.recallVector(entry.id);
+        const vector = vectors.get(entry.id);
         if (!vector) continue;
         const score = this.cosineSimilarity(inputVector, vector);
         if (score > minScore) scored.push({ entry, score });
+      }
+
+      if (index && indexed && older.length > 0) {
+        try {
+          const found = await index.search(
+            threadId,
+            inputVector,
+            INDEX_SEARCH_RESULTS + Math.max(0, scope.threadSize - older.length),
+            minScore
+          );
+          for (const { entry } of older) {
+            const score = found.get(entry.id);
+            if (score !== undefined && score > minScore) scored.push({ entry, score });
+          }
+        } catch (err) {
+          errors.push({
+            source: 'relevance',
+            error: err instanceof Error ? err : new Error(String(err)),
+          });
+        }
       }
       return scored.sort((a, b) => b.score - a.score);
     } catch (err) {
@@ -483,6 +553,27 @@ export class ContextBuilder {
       });
       return null;
     }
+  }
+
+  /** Vectors of `texts` by entry id from the builder's own cache, embedding the ones it lacks */
+  private async processVectors(texts: IndexedText[]): Promise<Map<string, Float32Array>> {
+    const embeddingService = this.deps.embeddingService;
+    const missing = texts.filter(({ entryId }) => !this.entryVectors.has(entryId));
+    if (embeddingService && missing.length > 0) {
+      const vectors = await embeddingService.embedBatch(missing.map(({ text }) => text));
+      if (vectors.length !== missing.length) {
+        throw new Error(
+          `Embedding returned ${vectors.length} vectors for ${missing.length} history entries`
+        );
+      }
+      missing.forEach(({ entryId }, i) => this.rememberVector(entryId, vectors[i]));
+    }
+    const found = new Map<string, Float32Array>();
+    for (const { entryId } of texts) {
+      const vector = this.recallVector(entryId);
+      if (vector) found.set(entryId, vector);
+    }
+    return found;
   }
 
   private rememberVector(entryId: string, vector: number[]): void {
@@ -507,7 +598,8 @@ export class ContextBuilder {
     entries: MemoryEntry[],
     availableTokens: number,
     currentInput: string | undefined,
-    errors: ContextBuildError[]
+    errors: ContextBuildError[],
+    scope: ScoringScope
   ): Promise<MemoryEntry[]> {
     if (!currentInput || !this.deps.embeddingService || entries.length <= 10) {
       return this.selectRecentEntries(entries, availableTokens);
@@ -520,7 +612,8 @@ export class ContextBuilder {
     const olderEntries = entries
       .slice(0, -10)
       .filter((e) => typeof e.message.content !== 'string' || e.message.content.length > 20);
-    const scoredEntries = (await this.scoreEntries(olderEntries, currentInput, 0.6, errors)) ?? [];
+    const scoredEntries =
+      (await this.scoreEntries(olderEntries, currentInput, 0.6, errors, scope)) ?? [];
 
     for (const { entry } of scoredEntries) {
       const tokens = countEntryTokens(entry);

@@ -20,7 +20,7 @@ import type {
   ToolResult,
 } from '@cogitator-ai/types';
 import { createRedisClient, type RedisClient } from '@cogitator-ai/redis';
-import { BaseMemoryAdapter } from './base';
+import { ChangeReportingMemoryAdapter } from './base';
 import { matchesListing, threadListing, threadPage, type ThreadCursor } from './thread-listing';
 
 /**
@@ -32,18 +32,27 @@ const LUA_MARKER = JSON.stringify(INDEX_MARKER);
 const SWEEP_BATCH = 20;
 
 /**
+ * How many thread lifetimes the index outlives a write by. A thread that expired stays in the
+ * index until a later write sweeps it and reports it deleted, also when every thread expired.
+ */
+const INDEX_LIFETIMES = 7;
+
+/**
  * Lua `sweep(index, cursorKey, prefix, ttl)`: checks the next index members, resuming the ZSCAN
  * where the last sweep stopped, and removes those whose thread expired. Every write sweeps, so the
- * index stays as big as the live threads even when nobody lists them.
+ * index stays as big as the live threads even when nobody lists them. Returns the ids it removed,
+ * which the adapter reports as deleted threads.
  */
 const SWEEP_INDEX = `
 local function sweep(index, cursorKey, prefix, ttl)
   local scanned = redis.call('ZSCAN', index, redis.call('GET', cursorKey) or '0', 'COUNT', ${SWEEP_BATCH})
   local members = scanned[2]
+  local removed = {}
   for i = 1, #members, 2 do
     local id = members[i]
     if id ~= ${LUA_MARKER} and redis.call('EXISTS', prefix .. 'thread:' .. id) == 0 then
       redis.call('ZREM', index, id)
+      removed[#removed + 1] = id
     end
   end
   if scanned[1] == '0' then
@@ -51,45 +60,54 @@ local function sweep(index, cursorKey, prefix, ttl)
   else
     redis.call('SET', cursorKey, scanned[1], 'EX', ttl)
   end
+  return removed
 end
 `;
+
+/** A write script's reply: whether it wrote, and the expired threads its sweep removed */
+function writeReply(reply: unknown): { written: boolean; expired: string[] } {
+  if (!Array.isArray(reply)) return { written: false, expired: [] };
+  const [written, ...expired] = reply;
+  return { written: Number(written) === 1, expired: expired.map(String) };
+}
 
 /** The stored thread, read on the primary like every write, never on a lagging replica. */
 const READ_THREAD = `return redis.call('GET', KEYS[1])`;
 
 /**
  * Writes a thread and its place in the thread index if the thread is still what the caller read:
- * absent when `ARGV[1]` is `'0'`, the JSON in `ARGV[2]` when it is `'1'`. The index lives as long
- * as the longest-living thread. Returns 1 when written.
+ * absent when `ARGV[1]` is `'0'`, the JSON in `ARGV[2]` when it is `'1'`. The index outlives the
+ * longest-living thread by {@link INDEX_LIFETIMES} lifetimes. Replies `{1, expired ids...}` when
+ * written, `{0}` otherwise.
  */
 const WRITE_THREAD = `${SWEEP_INDEX}
 local current = redis.call('GET', KEYS[1])
 if ARGV[1] == '1' then
-  if current ~= ARGV[2] then return 0 end
+  if current ~= ARGV[2] then return {0} end
 elseif current then
-  return 0
+  return {0}
 end
 redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
 redis.call('ZADD', KEYS[2], ARGV[5], ARGV[6])
-redis.call('EXPIRE', KEYS[2], ARGV[4])
-sweep(KEYS[2], KEYS[3], ARGV[7], ARGV[4])
-return 1
+redis.call('EXPIRE', KEYS[2], ARGV[4] * ${INDEX_LIFETIMES})
+local expired = sweep(KEYS[2], KEYS[3], ARGV[7], ARGV[4])
+return {1, unpack(expired)}
 `;
 
 /**
  * Adds an entry to a thread that exists, refreshing the TTL of the thread, its entries and the
- * index. Returns 1 when added.
+ * index. Replies `{1, expired ids...}` when added, `{0}` otherwise.
  */
 const ADD_ENTRY = `${SWEEP_INDEX}
-if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+if redis.call('EXISTS', KEYS[1]) == 0 then return {0} end
 redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[3])
 redis.call('ZADD', KEYS[2], ARGV[2], KEYS[3])
 redis.call('EXPIRE', KEYS[2], ARGV[3])
 redis.call('EXPIRE', KEYS[1], ARGV[3])
-if redis.call('EXPIRE', KEYS[4], ARGV[3]) == 1 then
-  sweep(KEYS[4], KEYS[5], ARGV[4], ARGV[3])
+if redis.call('EXPIRE', KEYS[4], ARGV[3] * ${INDEX_LIFETIMES}) == 1 then
+  return {1, unpack(sweep(KEYS[4], KEYS[5], ARGV[4], ARGV[3]))}
 end
-return 1
+return {1}
 `;
 
 /**
@@ -113,9 +131,10 @@ return #members
  * A step through the index with the stored threads, read on the primary: the members with the
  * score `ARGV[3]` (when given), then up to `ARGV[5]` members from the score bound `ARGV[4]` on, as
  * flat `id, score, thread JSON` rows. A member whose thread expired is removed and comes back
- * with no JSON, as does one whose key holds something else.
+ * with no JSON, as does one whose key holds something else. The ids it removed come last.
  */
 const INDEX_PAGE = `
+local expired = {}
 local function rows(members, withScores)
   local out = {}
   local step = withScores and 2 or 1
@@ -125,6 +144,7 @@ local function rows(members, withScores)
       local value = redis.pcall('GET', ARGV[1] .. 'thread:' .. id)
       if value == false then
         redis.call('ZREM', KEYS[1], id)
+        expired[#expired + 1] = id
       elseif type(value) ~= 'string' then
         value = false
       end
@@ -145,7 +165,8 @@ if ARGV[2] == 'desc' then
 else
   after = redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[4], '+inf', 'WITHSCORES', 'LIMIT', 0, ARGV[5])
 end
-return { #after / 2, tied, rows(after, true) }
+local page = rows(after, true)
+return { #after / 2, tied, page, expired }
 `;
 
 /** Moves a thread in the index to the score `ARGV[2]` if the thread is still the JSON `ARGV[1]`. */
@@ -160,7 +181,7 @@ const INDEX_STATE = `return redis.call('ZSCORE', KEYS[1], ARGV[1])`;
 /** Adds `score, member` pairs to the index, leaving members it already has as they are. */
 const INDEX_MISSING = `return redis.call('ZADD', KEYS[1], 'NX', unpack(ARGV))`;
 
-/** Marks the index complete, living as long as a thread written now. */
+/** Marks the index complete, living as long as the index after a write now. */
 const MARK_INDEXED = `
 redis.call('ZADD', KEYS[1], '-inf', ARGV[1])
 return redis.call('EXPIRE', KEYS[1], ARGV[2])
@@ -266,14 +287,29 @@ function indexRows(reply: unknown): IndexRow[] {
   return rows;
 }
 
-function indexPage(reply: unknown): { tied: IndexRow[]; after: IndexRow[]; read: number } {
-  if (!Array.isArray(reply) || reply.length !== 3 || typeof reply[0] !== 'number') {
+function indexPage(reply: unknown): {
+  tied: IndexRow[];
+  after: IndexRow[];
+  read: number;
+  expired: string[];
+} {
+  if (
+    !Array.isArray(reply) ||
+    reply.length !== 4 ||
+    typeof reply[0] !== 'number' ||
+    !Array.isArray(reply[3])
+  ) {
     throw new Error('Unexpected reply from Redis');
   }
-  return { read: reply[0], tied: indexRows(reply[1]), after: indexRows(reply[2]) };
+  return {
+    read: reply[0],
+    tied: indexRows(reply[1]),
+    after: indexRows(reply[2]),
+    expired: reply[3].map(String),
+  };
 }
 
-export class RedisAdapter extends BaseMemoryAdapter {
+export class RedisAdapter extends ChangeReportingMemoryAdapter {
   readonly provider: MemoryProvider = 'redis';
 
   private client: RedisClient | null = null;
@@ -373,6 +409,21 @@ export class RedisAdapter extends BaseMemoryAdapter {
     return `${this.prefix}threads:sweep`;
   }
 
+  /** Threads that expired, found by the index, reported as deleted */
+  private reportExpired(threadIds: string[]): void {
+    for (const threadId of threadIds) this.report({ type: 'thread-deleted', threadId });
+  }
+
+  /** Entries that expired inside a thread that lives on, by their keys, reported as deleted */
+  private reportExpiredEntries(keys: string[]): void {
+    const prefix = this.key('entry', '');
+    for (const key of keys) {
+      if (key.startsWith(prefix)) {
+        this.report({ type: 'entry-deleted', entryId: key.slice(prefix.length) });
+      }
+    }
+  }
+
   /**
    * Writes the thread `next` makes of the stored one, retrying when another writer changed it in
    * between, so concurrent writes all land. Returns null, writing nothing, when `next` does.
@@ -389,7 +440,7 @@ export class RedisAdapter extends BaseMemoryAdapter {
       const thread = next(current === null ? null : (parseThread(current) ?? null));
       if (!thread) return null;
       const json = JSON.stringify(thread);
-      const written = await client.eval(
+      const reply = await client.eval(
         WRITE_THREAD,
         3,
         threadKey,
@@ -403,7 +454,9 @@ export class RedisAdapter extends BaseMemoryAdapter {
         threadId,
         this.prefix
       );
-      if (written === 1) return parseThread(json) ?? null;
+      const { written, expired } = writeReply(reply);
+      this.reportExpired(expired);
+      if (written) return parseThread(json) ?? null;
     }
     throw new Error(`Thread ${threadId} changed on every one of ${MAX_WRITE_ATTEMPTS} attempts`);
   }
@@ -449,6 +502,13 @@ export class RedisAdapter extends BaseMemoryAdapter {
   }
 
   async deleteThread(threadId: string): Promise<MemoryResult<void>> {
+    return this.reported(await this.dropThread(threadId), () => ({
+      type: 'thread-deleted',
+      threadId,
+    }));
+  }
+
+  private async dropThread(threadId: string): Promise<MemoryResult<void>> {
     if (threadId === '') return this.success(undefined);
     return this.run(async (client) => {
       await client.eval(
@@ -515,7 +575,7 @@ export class RedisAdapter extends BaseMemoryAdapter {
     batch: number
   ): Promise<{ rows: IndexRow[]; exhausted: boolean }> {
     const start = position ? `(${position.updatedAt}` : order === 'desc' ? '+inf' : '-inf';
-    const { tied, after, read } = indexPage(
+    const { tied, after, read, expired } = indexPage(
       await client.eval(
         INDEX_PAGE,
         1,
@@ -527,6 +587,7 @@ export class RedisAdapter extends BaseMemoryAdapter {
         batch
       )
     );
+    this.reportExpired(expired);
     const sign = order === 'asc' ? 1 : -1;
     const later = position
       ? tied
@@ -551,7 +612,7 @@ export class RedisAdapter extends BaseMemoryAdapter {
       cursor = next;
       if (keys.length > 0) await this.indexStored(client, keys);
     } while (cursor !== '0');
-    await client.eval(MARK_INDEXED, 1, this.indexKey, INDEX_MARKER, this.ttl);
+    await client.eval(MARK_INDEXED, 1, this.indexKey, INDEX_MARKER, this.ttl * INDEX_LIFETIMES);
   }
 
   private async indexStored(client: RedisClient, keys: string[]): Promise<void> {
@@ -575,13 +636,20 @@ export class RedisAdapter extends BaseMemoryAdapter {
   }
 
   async addEntry(entry: NewMemoryEntry): Promise<MemoryResult<MemoryEntry>> {
+    return this.reported(await this.storeEntry(entry), (stored) => ({
+      type: 'entry-added',
+      entry: stored,
+    }));
+  }
+
+  private async storeEntry(entry: NewMemoryEntry): Promise<MemoryResult<MemoryEntry>> {
     return this.run(async (client) => {
       const id = this.generateId('entry');
       const createdAt = this.entryTimestamp(entry);
       const seq = await client.incr(`${this.prefix}entries:seq`);
       const json = JSON.stringify({ ...entry, id, createdAt, seq } satisfies StoredEntry);
 
-      const added = await client.eval(
+      const reply = await client.eval(
         ADD_ENTRY,
         5,
         this.key('thread', entry.threadId),
@@ -594,7 +662,9 @@ export class RedisAdapter extends BaseMemoryAdapter {
         this.ttl,
         this.prefix
       );
-      if (added !== 1) return this.failure(`Thread not found: ${entry.threadId}`);
+      const { written, expired } = writeReply(reply);
+      this.reportExpired(expired);
+      if (!written) return this.failure(`Thread not found: ${entry.threadId}`);
 
       return this.success(readEntry(parseEntry(json), true));
     });
@@ -629,6 +699,7 @@ export class RedisAdapter extends BaseMemoryAdapter {
         keys = keys.filter((_key, index) => found[index] !== null);
         if (expired.length === 0) break;
         await client.zrem(setKey, ...expired);
+        this.reportExpiredEntries(expired);
         if (ranged || !limit) break;
       }
 
@@ -674,6 +745,13 @@ export class RedisAdapter extends BaseMemoryAdapter {
   }
 
   async deleteEntry(entryId: string): Promise<MemoryResult<void>> {
+    return this.reported(await this.removeEntry(entryId), () => ({
+      type: 'entry-deleted',
+      entryId,
+    }));
+  }
+
+  private async removeEntry(entryId: string): Promise<MemoryResult<void>> {
     return this.run(async (client) => {
       const key = this.key('entry', entryId);
       const data = await client.get(key);
@@ -687,6 +765,13 @@ export class RedisAdapter extends BaseMemoryAdapter {
   }
 
   async clearThread(threadId: string): Promise<MemoryResult<void>> {
+    return this.reported(await this.emptyThread(threadId), () => ({
+      type: 'thread-cleared',
+      threadId,
+    }));
+  }
+
+  private async emptyThread(threadId: string): Promise<MemoryResult<void>> {
     return this.run(async (client) => {
       await client.eval(DROP_ENTRIES, 1, this.key('thread:entries', threadId));
       return this.success(undefined);

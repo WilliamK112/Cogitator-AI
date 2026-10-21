@@ -18,7 +18,9 @@ const { mockRedisClient, mockCreateRedisClient } = vi.hoisted(() => {
     set: vi.fn().mockResolvedValue('OK'),
     incr: vi.fn().mockResolvedValue(1),
     scan: vi.fn().mockResolvedValue(['0', []]),
-    eval: vi.fn().mockResolvedValue(1),
+    eval: vi.fn<(script: string, ...args: unknown[]) => Promise<unknown>>(async (script) =>
+      script.includes('local function sweep') ? [1] : 1
+    ),
     on: vi.fn(),
   };
   const mockCreateRedisClient = vi.fn().mockResolvedValue(mockRedisClient);
@@ -40,16 +42,19 @@ function scriptCalls(fragment: string): unknown[][] {
     .map(([, ...rest]) => rest);
 }
 
+/** Whether `script` is a write that sweeps the thread index, replying `{written, expired...}` */
+const sweeps = (script: string) => script.includes('local function sweep');
+
 /** Answers the read of a stored thread with `stored`, and every write with `written`. */
 function storedThread(stored: () => string | null, written: () => number = () => 1): void {
   mockRedisClient.eval.mockImplementation(async (script: string) =>
-    script === READ_THREAD ? stored() : written()
+    script === READ_THREAD ? stored() : sweeps(script) ? [written()] : written()
   );
 }
 
 function resetEval(): void {
   mockRedisClient.eval.mockReset();
-  mockRedisClient.eval.mockResolvedValue(1);
+  mockRedisClient.eval.mockImplementation(async (script: string) => (sweeps(script) ? [1] : 1));
 }
 
 describe('RedisAdapter', () => {
@@ -141,7 +146,7 @@ describe('RedisAdapter', () => {
       ) ?? [''];
       expect(script).toContain("redis.call('ZSCAN', index");
       expect(script).toContain("redis.call('EXISTS', prefix .. 'thread:' .. id) == 0");
-      expect(script).toContain("redis.call('EXPIRE', KEYS[2], ARGV[4])");
+      expect(script).toContain("redis.call('EXPIRE', KEYS[2], ARGV[4] * 7)");
       expect(script).toContain('sweep(KEYS[2], KEYS[3], ARGV[7], ARGV[4])');
     });
 
@@ -294,8 +299,31 @@ describe('RedisAdapter', () => {
       expect(JSON.parse(String(json))).toMatchObject({ seq: 1 });
     });
 
+    it('reports threads its sweep found expired as deleted', async () => {
+      const changes: unknown[] = [];
+      adapter.onChange((change) => changes.push(change));
+      mockRedisClient.eval.mockResolvedValueOnce([1, 'gone-1', 'gone-2']);
+
+      const result = await adapter.addEntry({
+        threadId: 't1',
+        message: { role: 'user', content: 'hi' },
+        tokenCount: 1,
+      });
+
+      expect(result.success).toBe(true);
+      expect(changes.map((change) => (change as { type: string }).type)).toEqual([
+        'thread-deleted',
+        'thread-deleted',
+        'entry-added',
+      ]);
+      expect(changes.slice(0, 2)).toEqual([
+        { type: 'thread-deleted', threadId: 'gone-1' },
+        { type: 'thread-deleted', threadId: 'gone-2' },
+      ]);
+    });
+
     it('refuses an entry for a thread that does not exist', async () => {
-      mockRedisClient.eval.mockResolvedValueOnce(0);
+      mockRedisClient.eval.mockResolvedValueOnce([0]);
 
       const result = await adapter.addEntry({
         threadId: 'missing',
@@ -514,6 +542,22 @@ describe('RedisAdapter hardening', () => {
     expect(result.success && result.data.map((e) => e.id)).toEqual(['e1', 'e2']);
   });
 
+  it('reports entries that expired inside a thread as deleted', async () => {
+    const adapter = new RedisAdapter({ provider: 'redis', host: 'localhost' });
+    await adapter.connect();
+    const changes: unknown[] = [];
+    adapter.onChange((change) => changes.push(change));
+    mockRedisClient.zrange.mockResolvedValueOnce(['cogitator:entry:e1', 'cogitator:entry:e2']);
+    mockRedisClient.mget.mockResolvedValueOnce([null, null]);
+
+    await adapter.getEntries({ threadId: 't1' });
+
+    expect(changes).toEqual([
+      { type: 'entry-deleted', entryId: 'e1' },
+      { type: 'entry-deleted', entryId: 'e2' },
+    ]);
+  });
+
   it('refreshes the thread TTL when entries are added', async () => {
     const adapter = new RedisAdapter({ provider: 'redis', host: 'localhost', ttl: 60 });
     await adapter.connect();
@@ -526,7 +570,7 @@ describe('RedisAdapter hardening', () => {
 
     const [script, , threadKey, , , , , , , ttl] = mockRedisClient.eval.mock.calls[0] ?? [];
     expect(script).toContain("redis.call('EXPIRE', KEYS[1], ARGV[3])");
-    expect(script).toContain("if redis.call('EXPIRE', KEYS[4], ARGV[3]) == 1 then");
+    expect(script).toContain("if redis.call('EXPIRE', KEYS[4], ARGV[3] * 7) == 1 then");
     expect(script).toContain('sweep(KEYS[4], KEYS[5], ARGV[4], ARGV[3])');
     expect([threadKey, ttl]).toEqual(['cogitator:thread:t1', 60]);
   });
@@ -636,11 +680,17 @@ describe('RedisAdapter listThreads', () => {
     page?: (args: unknown[]) => unknown;
   }
 
-  /** Dispatches `eval` by script: whether the index is complete, a page, anything else 1. */
+  /**
+   * Dispatches `eval` by script: whether the index is complete, a page (with no expired threads
+   * unless it names them), anything else 1.
+   */
   function scripts({ complete = () => '-inf', page = () => [0, [], []] }: Scripts): void {
     mockRedisClient.eval.mockImplementation(async (script: string, ...args: unknown[]) => {
       if (script.includes('ZSCORE')) return complete();
-      if (script.includes('ZREVRANGEBYSCORE')) return page(args);
+      if (script.includes('ZREVRANGEBYSCORE')) {
+        const reply = page(args);
+        return Array.isArray(reply) && reply.length === 3 ? [...reply, []] : reply;
+      }
       return 1;
     });
   }
@@ -695,7 +745,7 @@ describe('RedisAdapter listThreads', () => {
     );
     expect(scriptCalls("'NX'")).toEqual([[1, 'cogitator:threads:index', 2000, 'old']]);
     expect(scriptCalls("redis.call('ZADD', KEYS[1], '-inf', ARGV[1])")).toEqual([
-      [1, 'cogitator:threads:index', '', 60],
+      [1, 'cogitator:threads:index', '', 420],
     ]);
   });
 
@@ -797,6 +847,17 @@ describe('RedisAdapter listThreads', () => {
     );
     expect(keys.length).toBeGreaterThan(0);
     for (const key of keys) expect(String(key)).toMatch(/^\{myapp\}:/);
+  });
+
+  it('reports threads the listing found expired as deleted', async () => {
+    scripts({ page: () => [2, [], rows(['live', 1000, stored('live', 1000)]), ['gone']] });
+    const changes: unknown[] = [];
+    adapter.onChange((change) => changes.push(change));
+
+    const listed = await adapter.listThreads();
+
+    expect(listed.success && listed.data.threads.map((t) => t.id)).toEqual(['live']);
+    expect(changes).toEqual([{ type: 'thread-deleted', threadId: 'gone' }]);
   });
 
   it('moves a thread whose index member is behind its stored update time and skips it there', async () => {

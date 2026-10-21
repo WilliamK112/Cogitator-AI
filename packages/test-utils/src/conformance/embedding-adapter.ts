@@ -22,7 +22,9 @@ export type EmbeddingAdapterScenario =
   | 'delete-embedding'
   | 'delete-by-source'
   | 'delete-by-filter'
-  | 'missing-not-null';
+  | 'missing-not-null'
+  | 'get-by-sources'
+  | 'replace-by-source';
 
 /** One case of the embedding store contract. */
 export interface EmbeddingAdapterConformanceCase {
@@ -157,6 +159,17 @@ const SCENARIOS: Record<
     assert.deepEqual(await contents({ metadata: { lang: 'de' } }), ['document in t2']);
     assert.deepEqual(await contents({ metadata: { rank: 1 } }), ['message in t1']);
     assert.deepEqual(await contents({ metadata: { rank: '1' } }), [], 'values compare by type');
+    assert.deepEqual(
+      (await contents({ sourceTypes: ['message', 'document'] })).sort(),
+      ['document in t2', 'message in t1'],
+      'a list of source types takes in any of them'
+    );
+    assert.deepEqual(await contents({ sourceTypes: ['fact', 'document'] }), ['document in t2']);
+    assert.deepEqual(
+      await contents({ sourceType: 'message', sourceTypes: ['fact', 'document'] }),
+      [],
+      'sourceType and sourceTypes both apply'
+    );
   },
 
   async 'user-scope'(adapter, dimensions) {
@@ -273,6 +286,81 @@ const SCENARIOS: Record<
     }
     assert.equal(found.sourceId, source('plain'));
     assert.equal(found.sourceType, 'document');
+  },
+
+  async 'get-by-sources'(adapter, dimensions) {
+    if (!adapter.getBySources) return;
+    const { agentId, source } = scope();
+    const first = axis(dimensions, 0, 0.5);
+    const second = axis(dimensions, 1, 0.25);
+    await add(adapter, {
+      sourceId: source('one'),
+      sourceType: 'message',
+      vector: first,
+      content: 'one',
+      metadata: { agentId, model: 'm' },
+    });
+    await add(adapter, {
+      sourceId: source('two'),
+      sourceType: 'message',
+      vector: second,
+      content: 'two',
+      metadata: { agentId },
+    });
+    await add(adapter, {
+      sourceId: source('other'),
+      sourceType: 'message',
+      vector: second,
+      content: 'other',
+    });
+
+    const found = ok(
+      await adapter.getBySources([source('one'), source('two'), source('missing')]),
+      'getBySources'
+    ).sort((a, b) => a.content.localeCompare(b.content));
+    assert.deepEqual(
+      found.map((embedding) => [embedding.sourceId, embedding.content, embedding.metadata?.model]),
+      [
+        [source('one'), 'one', 'm'],
+        [source('two'), 'two', undefined],
+      ]
+    );
+    for (const [i, expected] of [first, second].entries()) {
+      assert.equal(found[i].vector.length, dimensions, 'vectors come back whole');
+      for (const [d, value] of expected.entries()) {
+        assert.ok(Math.abs(found[i].vector[d] - value) < 1e-5, 'vectors come back as stored');
+      }
+    }
+    assert.deepEqual(ok(await adapter.getBySources([]), 'getBySources of nothing'), []);
+  },
+
+  async 'replace-by-source'(adapter, dimensions) {
+    if (!adapter.replaceBySource || !adapter.getBySources) return;
+    const { agentId, source } = scope();
+    const id = source('replaced');
+    await add(adapter, {
+      sourceId: id,
+      sourceType: 'message',
+      vector: axis(dimensions, 0),
+      content: 'old',
+      metadata: { agentId },
+    });
+    const replace = adapter.replaceBySource.bind(adapter);
+    await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        replace({
+          sourceId: id,
+          sourceType: 'message',
+          vector: axis(dimensions, 1),
+          content: `new ${i}`,
+          metadata: { agentId },
+        })
+      )
+    );
+
+    const stored = ok(await adapter.getBySources([id]), 'getBySources');
+    assert.equal(stored.length, 1, 'replacing at once leaves one embedding of the source');
+    assert.match(stored[0]!.content, /^new \d$/);
   },
 };
 
