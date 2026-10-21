@@ -973,6 +973,8 @@ export class Cogitator implements ToolInvoker {
                 result: null,
                 error: 'Duplicate tool call detected. Try a different approach.',
               };
+              options.onToolCall?.(tc);
+              options.onToolResult?.(errorResult);
               const duplicateMessage = createToolMessage(tc, errorResult);
               messages.push(duplicateMessage);
               if (
@@ -1535,6 +1537,12 @@ export class Cogitator implements ToolInvoker {
           });
           continue;
         }
+
+        options.onModelTurn?.({
+          content: outputContent,
+          toolCalls: requestsTools ? (response.toolCalls ?? []) : [],
+          model: answeredBy.name,
+        });
 
         if (
           this.state.memoryAdapter &&

@@ -796,6 +796,9 @@ importers:
       '@cogitator-ai/swarms':
         specifier: workspace:*
         version: link:../swarms
+      '@cogitator-ai/test-utils':
+        specifier: workspace:*
+        version: link:../test-utils
       '@cogitator-ai/tetsu':
         specifier: workspace:*
         version: link:../tetsu
@@ -841,6 +844,9 @@ importers:
       koa:
         specifier: ^3.2.1
         version: 3.2.1
+      mongodb:
+        specifier: ^7.7.0
+        version: 7.7.0
       zod:
         specifier: ^4.6.5
         version: 4.6.5
@@ -1323,6 +1329,9 @@ importers:
         specifier: ^4.6.5
         version: 4.6.5
     devDependencies:
+      '@cogitator-ai/test-utils':
+        specifier: workspace:*
+        version: link:../test-utils
       '@qdrant/js-client-rest':
         specifier: ^1.19.0
         version: 1.19.0(typescript@6.0.3)
