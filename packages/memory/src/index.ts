@@ -242,3 +242,38 @@ export type {
   CompactionConfig,
   CompactionResult,
 } from '@cogitator-ai/types';
+
+export {
+  MemoryItems,
+  DEFAULT_ACTIVATION_CONFIDENCE,
+  OPINION_GAIN,
+  OPINION_LOSS,
+  byRecorded,
+  entityNames,
+  isMemoryItemAdapter,
+  matchesEntityFilter,
+  matchesItemFilter,
+  normalizeName,
+  sameValue,
+  slotOf,
+  visibleIn,
+  type MemoryItemsConfig,
+} from './memory-items';
+export {
+  calendarDate,
+  isTimeZone,
+  resolveTime,
+  type TimeExpression,
+  type Weekday,
+} from './time-resolution';
+export {
+  EXTRACTION_PROMPT,
+  ExtractionAnswerError,
+  MemoryExtractor,
+  WindowError,
+  parseExtraction,
+  sessionLine,
+  trustOfEntry,
+  type MemoryExtractionContext,
+  type MemoryExtractorConfig,
+} from './memory-extraction';

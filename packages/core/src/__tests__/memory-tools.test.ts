@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createMemoryTools } from '../tools/memory-tools';
 import type { MemoryToolsConfig } from '../tools/memory-tools';
 import { createToolContext } from './helpers/tool-context';
+import { InMemoryAdapter, MemoryItems } from '@cogitator-ai/memory';
 
 /** The memory tools by name; createMemoryTools returns them as a typed tuple. */
 function byName(tools: ReturnType<typeof createMemoryTools>) {
@@ -339,6 +340,167 @@ describe('createMemoryTools', () => {
 
       expect(mocks.mockGraph.deleteNode).not.toHaveBeenCalled();
       expect(result).toEqual({ deleted: 0, items: [] });
+    });
+  });
+
+  describe('grounded in the conversation', () => {
+    async function conversation() {
+      const adapter = new InMemoryAdapter({ provider: 'memory' });
+      await adapter.createThread('a1', {}, 't1');
+      await adapter.addEntry({
+        threadId: 't1',
+        message: { role: 'user', content: 'Please remember: my sister is called Rita.' },
+        tokenCount: 1,
+      });
+      await adapter.addEntry({
+        threadId: 't1',
+        message: { role: 'assistant', content: 'Your favourite colour must be blue.' },
+        tokenCount: 1,
+      });
+      return { adapter, items: new MemoryItems({ adapter }) };
+    }
+    const context = createToolContext({ threadId: 't1', userId: 'u1' });
+
+    it("keeps a fact as the user's when its quote is in a user message", async () => {
+      const { adapter, items } = await conversation();
+      const { remember } = byName(
+        createMemoryTools(createConfig(mocks, { items, memory: adapter }))
+      );
+
+      const result = await remember.execute(
+        {
+          fact: "The user's sister is called Rita",
+          quote: 'my sister is called Rita',
+          isCoreFact: true,
+          coreFactKey: 'sister',
+        },
+        context
+      );
+
+      expect(result).toMatchObject({ saved: true, status: 'active' });
+      expect(mocks.mockGraph.addNode).toHaveBeenCalledWith(
+        expect.objectContaining({ source: 'user', confidence: 1 })
+      );
+      expect(mocks.mockCoreFacts.set).toHaveBeenCalledWith(
+        'sister',
+        "The user's sister is called Rita"
+      );
+      const [kept] = await items.query({ scope: { agentId: 'a1', userId: 'u1' } });
+      expect(kept).toMatchObject({ trust: 'user', verified: true, status: 'active' });
+    });
+
+    it('keeps a fact only as a suggestion when the user never said it', async () => {
+      const { adapter, items } = await conversation();
+      const { remember } = byName(
+        createMemoryTools(createConfig(mocks, { items, memory: adapter }))
+      );
+
+      const result = await remember.execute(
+        {
+          fact: "The user's favourite colour is blue",
+          quote: 'Your favourite colour must be blue',
+          isCoreFact: true,
+          coreFactKey: 'colour',
+        },
+        context
+      );
+
+      expect(result).toMatchObject({ saved: true, status: 'suggested', coreFact: false });
+      expect(mocks.mockGraph.addNode).toHaveBeenCalledWith(
+        expect.objectContaining({ source: 'inferred' })
+      );
+      expect(mocks.mockCoreFacts.set).not.toHaveBeenCalled();
+      expect(await items.query({ scope: { agentId: 'a1', userId: 'u1' } })).toEqual([]);
+    });
+
+    it('recalls memory items and lets forgotten ones go', async () => {
+      const { adapter, items } = await conversation();
+      const tools = byName(createMemoryTools(createConfig(mocks, { items, memory: adapter })));
+      await tools.remember.execute(
+        { fact: 'Sister: Rita', quote: 'my sister is called Rita' },
+        context
+      );
+
+      const recalled = await tools.recall.execute({ query: 'rita' }, context);
+      expect(recalled.results).toContainEqual(
+        expect.objectContaining({ fact: 'Sister: Rita', type: 'memory' })
+      );
+
+      const forgotten = await tools.forget.execute({ query: 'rita' }, context);
+      expect(forgotten).toMatchObject({ forgotten: ['Sister: Rita'] });
+      expect(await items.query({ scope: { agentId: 'a1', userId: 'u1' }, text: 'rita' })).toEqual(
+        []
+      );
+    });
+  });
+
+  describe('forget', () => {
+    it("lets go only the run's own items that hold the words", async () => {
+      const adapter = new InMemoryAdapter({ provider: 'memory' });
+      const items = new MemoryItems({ adapter });
+      const fact = (content: string, scope: Record<string, string>) => ({
+        kind: 'fact' as const,
+        content,
+        trust: 'system' as const,
+        confidence: 1,
+        evidence: [],
+        saidAt: new Date(),
+        sessionAt: new Date(),
+        scope: { agentId: 'a1', ...scope },
+      });
+      await items.write([
+        fact('Pricing is per seat', {}),
+        fact('My pricing tier is pro', { userId: 'u1' }),
+        fact('Bo likes apricots', { userId: 'u1' }),
+        fact('Bo pays for pricing', { userId: 'u2' }),
+      ]);
+      const { forget } = byName(createMemoryTools(createConfig(mocks, { items })));
+
+      const result = await forget.execute(
+        { query: 'pricing' },
+        createToolContext({ userId: 'u1', threadId: 't1' })
+      );
+
+      expect(result).toMatchObject({ forgotten: ['My pricing tier is pro'] });
+      const left = await items.query({ scope: { agentId: 'a1', userId: 'u1' } });
+      expect(left.map((item) => item.content).sort()).toEqual([
+        'Bo likes apricots',
+        'Pricing is per seat',
+      ]);
+      expect(
+        (await forget.execute({ query: 'a' }, createToolContext({ userId: 'u1' }))).forgotten
+      ).toBeUndefined();
+    });
+
+    it('forgets past and suggested states, and words of scripts without spaces', async () => {
+      const adapter = new InMemoryAdapter({ provider: 'memory' });
+      const items = new MemoryItems({ adapter });
+      const place = (content: string, value: string, day: number, attribute = 'street') => ({
+        kind: 'fact' as const,
+        content,
+        subject: 'user',
+        attribute,
+        value,
+        trust: 'user' as const,
+        confidence: 0.9,
+        evidence: [],
+        verified: true,
+        saidAt: new Date(2026, 0, day),
+        sessionAt: new Date(2026, 0, day),
+        scope: { agentId: 'a1', userId: 'u1' },
+      });
+      await items.write([place('I live on Baker St', 'Baker St', 1)]);
+      await items.write([place('I live on Oak Ave', 'Oak Ave', 2)]);
+      await items.write([place('私は東京に住んでいる', '東京', 3, 'city')]);
+      const { forget } = byName(createMemoryTools(createConfig(mocks, { items })));
+      const context = createToolContext({ userId: 'u1' });
+
+      expect(await forget.execute({ query: 'Baker St' }, context)).toMatchObject({
+        forgotten: ['I live on Baker St'],
+      });
+      expect(await forget.execute({ query: '東京' }, context)).toMatchObject({
+        forgotten: ['私は東京に住んでいる'],
+      });
     });
   });
 });

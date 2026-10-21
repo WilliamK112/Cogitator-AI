@@ -40,10 +40,11 @@ import type {
   ModelCallRequest,
   RunMiddleware,
 } from '@cogitator-ai/types';
-import { type Agent } from './agent';
+import { memoryAgentId, type Agent } from './agent';
 import { ToolRegistry } from './registry';
 import { createLLMBackend } from './llm/index';
 import { memoryCompactionMiddleware, type CompactionRun } from './middleware/memory-compaction';
+import { memoryExtractionMiddleware } from './middleware/memory-extraction';
 import { LLMError, llmInvalidResponse } from './llm/errors';
 import { isLLMProvider } from './llm/providers';
 import { createLLMBackendFromPlugin, hasLLMPlugin } from './llm/plugin';
@@ -245,6 +246,7 @@ export class Cogitator implements ToolInvoker {
   private piiLayer?: RunMiddleware;
   private clearingLayer?: RunMiddleware;
   private memoryCompactionLayer?: RunMiddleware;
+  private memoryExtractionLayer?: RunMiddleware;
   /** What the `afterRun` hooks of a run spent on the model, by run, added to its usage */
   private readonly afterRunSpend = new Map<
     string,
@@ -518,8 +520,8 @@ export class Cogitator implements ToolInvoker {
    * The middleware the runtime's own features become, closest to the model, in this order:
    * PII masking (`security.pii`), prompt injection (`security.promptInjection`), guardrails
    * (`guardrails`), tool output clearing (`context.clearToolOutputs`), compaction of a turn
-   * (`context`) and compaction of the thread after a run (`memory.compaction`). Each is there once
-   * its feature is set up.
+   * (`context`), extraction of memory items after a run (`memory.extraction`) and compaction of
+   * the thread after a run (`memory.compaction`). Each is there once its feature is set up.
    */
   private builtinMiddleware(): RunMiddleware[] {
     const pii = this.config.security?.pii;
@@ -527,6 +529,13 @@ export class Cogitator implements ToolInvoker {
     const clearing = this.config.context?.clearToolOutputs;
     if (clearing) {
       this.clearingLayer ??= clearToolOutputsMiddleware(clearing === true ? {} : clearing);
+    }
+    const memoryExtraction = this.config.memory?.extraction;
+    if (memoryExtraction) {
+      this.memoryExtractionLayer ??= memoryExtractionMiddleware(memoryExtraction, {
+        memory: () => this.state.memoryAdapter,
+        summarizer: (model, run) => this.summarizerFor(model, run),
+      });
     }
     const memoryCompaction = this.config.memory?.compaction;
     if (memoryCompaction) {
@@ -543,6 +552,7 @@ export class Cogitator implements ToolInvoker {
       ...(constitutionalAI ? [guardrailsMiddleware(constitutionalAI)] : []),
       ...(this.clearingLayer ? [this.clearingLayer] : []),
       ...(contextManager ? [compactionMiddleware(contextManager)] : []),
+      ...(this.memoryExtractionLayer ? [this.memoryExtractionLayer] : []),
       ...(this.memoryCompactionLayer ? [this.memoryCompactionLayer] : []),
     ];
   }
@@ -562,6 +572,7 @@ export class Cogitator implements ToolInvoker {
           { role: 'system', content: options?.prompt ?? 'Summarize the conversation.' },
           ...messages,
         ],
+        ...(options?.maxTokens !== undefined && { maxTokens: options.maxTokens }),
         ...(signal && { signal }),
       });
       const priced = this.pricedModel(model);
@@ -1842,7 +1853,11 @@ export class Cogitator implements ToolInvoker {
 
       await runMemory.settled();
       await pipeline.afterRun(
-        { result, model: fellBackTo ?? this.pricedModel(effectiveModel, routeProvider) },
+        {
+          result,
+          model: fellBackTo ?? this.pricedModel(effectiveModel, routeProvider),
+          memoryAgentId: memoryAgentId(agent),
+        },
         middlewareContext()
       );
       const afterRun = this.afterRunSpend.get(runId);

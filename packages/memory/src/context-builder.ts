@@ -18,10 +18,14 @@ import type {
   GraphNode,
   MemoryAdapter,
   FactAdapter,
+  MemoryItem,
+  MemoryItemKind,
+  MemoryItemTrust,
   EmbeddingAdapter,
   EmbeddingService,
   MemoryResult,
 } from '@cogitator-ai/types';
+import { visibleIn, type MemoryItems } from './memory-items';
 import type { GraphContextBuilder } from './knowledge-graph/graph-context-builder';
 import { readCompactedHistory } from './compaction';
 import {
@@ -89,6 +93,127 @@ export function withoutTurnContext(text: string): string {
   if (!text.startsWith(TURN_CONTEXT_OPEN)) return text;
   const end = text.indexOf(TURN_CONTEXT_CLOSE);
   return end === -1 ? text : text.slice(end + TURN_CONTEXT_CLOSE.length).replace(/^\s+/, '');
+}
+
+/** The order kinds of memory items go into a context in: what steers the answer first */
+const KIND_ORDER: Record<MemoryItemKind, number> = {
+  instruction: 0,
+  preference: 1,
+  fact: 2,
+  opinion: 3,
+  event: 4,
+  lesson: 5,
+};
+
+const SOURCE_OF_TRUST: Record<MemoryItemTrust, Fact['source']> = {
+  user: 'user',
+  system: 'system',
+  model: 'inferred',
+  tool: 'inferred',
+  web: 'inferred',
+};
+
+/** A line of the `Known facts` block, with the value a fact replaced when it replaced one */
+function factLine(fact: Fact): string {
+  const previously = fact.metadata?.previously;
+  return typeof previously === 'string' && previously
+    ? `- ${fact.content} (previously: ${previously})`
+    : `- ${fact.content}`;
+}
+
+/** How narrow a scope is: a thread's items over a user's, a user's over the agent's */
+function narrowness(item: MemoryItem): number {
+  return (
+    (item.scope.threadId !== undefined ? 4 : 0) +
+    (item.scope.projectId !== undefined ? 2 : 0) +
+    (item.scope.userId !== undefined ? 1 : 0)
+  );
+}
+
+/** Whether state `a` of a slot wins over `b`: it started later, or together in a narrower scope */
+function laterState(a: MemoryItem, b: MemoryItem): boolean {
+  const since = (a.validFrom?.getTime() ?? 0) - (b.validFrom?.getTime() ?? 0);
+  return since !== 0 ? since > 0 : narrowness(a) > narrowness(b);
+}
+
+/**
+ * `items` with one item per slot: the one that started to hold last, of the narrowest scope when
+ * two started together, since a run sees a slot's states of its thread, its user and the agent
+ * at once
+ */
+function onePerSlot(items: readonly MemoryItem[]): MemoryItem[] {
+  const bySlot = new Map<string, MemoryItem>();
+  const kept: MemoryItem[] = [];
+  for (const item of items) {
+    if (item.slot === undefined) {
+      kept.push(item);
+      continue;
+    }
+    const known = bySlot.get(item.slot);
+    if (!known || laterState(item, known)) bySlot.set(item.slot, item);
+  }
+  return [...kept, ...bySlot.values()];
+}
+
+/**
+ * The memory items of the run's agent, user and thread that hold now, as facts, under the
+ * agent's memory id and under its runtime id (where facts added for `agent.id` are): one per slot,
+ * instructions and preferences first, newest first within a kind, each with the value of the
+ * item it superseded when the run may still see it
+ */
+async function loadItemFacts(items: MemoryItems, options: BuildContextOptions): Promise<Fact[]> {
+  const agentIds = [...new Set([options.memoryAgentId ?? options.agentId, options.agentId])];
+  const found = await Promise.all(
+    agentIds.map((agentId) =>
+      items.query({
+        scope: {
+          agentId,
+          ...(options.userId !== undefined && { userId: options.userId }),
+          threadId: options.threadId,
+        },
+      })
+    )
+  );
+  const current = [...new Map(found.flat().map((item) => [item.id, item])).values()];
+  const scope = {
+    agentId: options.memoryAgentId ?? options.agentId,
+    ...(options.userId !== undefined && { userId: options.userId }),
+    threadId: options.threadId,
+  };
+  const ordered = onePerSlot(current).sort(
+    (a, b) =>
+      KIND_ORDER[a.kind] - KIND_ORDER[b.kind] || b.recordedAt.getTime() - a.recordedAt.getTime()
+  );
+  return Promise.all(
+    ordered.map(async (item): Promise<Fact> => {
+      const replaced = item.supersedes?.at(-1);
+      const before = replaced ? await items.get(replaced) : null;
+      const shown =
+        before &&
+        agentIds.includes(before.scope.agentId) &&
+        visibleIn(before, { ...scope, agentId: before.scope.agentId }) &&
+        (before.expiredAt === undefined || before.expiredAt.getTime() > Date.now());
+      const previously = shown ? (before.value ?? before.content) : undefined;
+      return {
+        id: item.id,
+        agentId: item.scope.agentId,
+        content: item.content,
+        category: item.kind,
+        confidence: item.confidence,
+        source: SOURCE_OF_TRUST[item.trust],
+        createdAt: item.recordedAt,
+        updatedAt: item.recordedAt,
+        evidence: item.evidence,
+        metadata: {
+          ...item.metadata,
+          ...(item.scope.userId !== undefined && { userId: item.scope.userId }),
+          ...(item.slot !== undefined && { slot: item.slot }),
+          trust: item.trust,
+          ...(previously !== undefined && { previously }),
+        },
+      };
+    })
+  );
 }
 
 /** What a block of a context holds */
@@ -175,6 +300,11 @@ function isVisibleTo(
 export interface ContextBuilderDeps {
   memoryAdapter: MemoryAdapter;
   factAdapter?: FactAdapter;
+  /**
+   * Memory items, read for the facts in place of `factAdapter`: the items the run's agent,
+   * user and thread see that hold now
+   */
+  memoryItems?: MemoryItems;
   embeddingAdapter?: EmbeddingAdapter;
   embeddingService?: EmbeddingService;
   graphContextBuilder?: GraphContextBuilder;
@@ -189,6 +319,11 @@ export interface ContextBuilderDeps {
 export interface BuildContextOptions {
   threadId: string;
   agentId: string;
+  /**
+   * The id the agent's memory items are kept under, `agentId` by default: a runtime passes the
+   * agent's configured id, else its name, which stays the same across instances
+   */
+  memoryAgentId?: string;
   /** The user the context is built for: facts and embeddings of other users are left out */
   userId?: string;
   systemPrompt?: string;
@@ -313,7 +448,7 @@ export class ContextBuilder {
         partition: 'facts',
         blocks: facts.map((fact) => ({
           value: { kind: 'fact', fact },
-          tokens: countTokens(`- ${fact.content}`),
+          tokens: countTokens(factLine(fact)),
           text: fact.content,
           sourceId: fact.id,
         })),
@@ -465,9 +600,7 @@ export class ContextBuilder {
       .find((value) => value.kind === 'graph')?.context;
     const turnBlocks = [
       ...textsOf('brief'),
-      ...(facts.length > 0
-        ? [`Known facts:\n${facts.map((f) => `- ${f.content}`).join('\n')}`]
-        : []),
+      ...(facts.length > 0 ? [`Known facts:\n${facts.map(factLine).join('\n')}`] : []),
       ...(semanticResults.length > 0
         ? [`Relevant context:\n${semanticResults.map((r) => `- ${r.content}`).join('\n')}`]
         : []),
@@ -536,6 +669,7 @@ export class ContextBuilder {
 
   /** Facts of the agent visible to the user */
   private async loadFacts(options: BuildContextOptions): Promise<Fact[]> {
+    if (this.deps.memoryItems) return loadItemFacts(this.deps.memoryItems, options);
     if (!this.deps.factAdapter) return [];
     const all = unwrap(await this.deps.factAdapter.getFacts(options.agentId), 'getFacts');
     return all.filter((fact) => isVisibleTo(fact.metadata, options.agentId, options.userId));
