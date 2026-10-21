@@ -43,13 +43,14 @@ import type {
 import { type Agent } from './agent';
 import { ToolRegistry } from './registry';
 import { createLLMBackend } from './llm/index';
+import { memoryCompactionMiddleware, type CompactionRun } from './middleware/memory-compaction';
 import { LLMError, llmInvalidResponse } from './llm/errors';
 import { isLLMProvider } from './llm/providers';
 import { createLLMBackendFromPlugin, hasLLMPlugin } from './llm/plugin';
 import { withLLMRetry } from './llm/retry';
 import { ModelFallbackChain, type ModelCandidate } from './llm/model-fallback';
 import { modelContextWindow } from './context/model-window';
-import { countMessagesTokens, countTokens } from '@cogitator-ai/memory';
+import { countMessagesTokens, countTokens, type SummarizeFn } from '@cogitator-ai/memory';
 import { TruncateStrategy } from './context/strategies/index';
 import { sanitizeToolHistory } from './utils/tool-history';
 import { normalizeTurn } from './llm/turn';
@@ -243,6 +244,12 @@ export class Cogitator implements ToolInvoker {
   private turnBackends = new Map<string, LLMBackend>();
   private piiLayer?: RunMiddleware;
   private clearingLayer?: RunMiddleware;
+  private memoryCompactionLayer?: RunMiddleware;
+  /** What the `afterRun` hooks of a run spent on the model, by run, added to its usage */
+  private readonly afterRunSpend = new Map<
+    string,
+    { inputTokens: number; outputTokens: number; cost: number }
+  >();
   private recallTool?: Tool;
   /** The memory of each run going on, for `recall_tool_output` to read the run's branch */
   private readonly runMemories = new Map<string, RunMemory>();
@@ -510,8 +517,9 @@ export class Cogitator implements ToolInvoker {
   /**
    * The middleware the runtime's own features become, closest to the model, in this order:
    * PII masking (`security.pii`), prompt injection (`security.promptInjection`), guardrails
-   * (`guardrails`), tool output clearing (`context.clearToolOutputs`) and compaction
-   * (`context`). Each is there once its feature is set up.
+   * (`guardrails`), tool output clearing (`context.clearToolOutputs`), compaction of a turn
+   * (`context`) and compaction of the thread after a run (`memory.compaction`). Each is there once
+   * its feature is set up.
    */
   private builtinMiddleware(): RunMiddleware[] {
     const pii = this.config.security?.pii;
@@ -520,6 +528,14 @@ export class Cogitator implements ToolInvoker {
     if (clearing) {
       this.clearingLayer ??= clearToolOutputsMiddleware(clearing === true ? {} : clearing);
     }
+    const memoryCompaction = this.config.memory?.compaction;
+    if (memoryCompaction) {
+      this.memoryCompactionLayer ??= memoryCompactionMiddleware(memoryCompaction, {
+        memory: () => this.state.memoryAdapter,
+        summarizer: (model, run) => this.summarizerFor(model, run),
+        windowOf: (model) => this.servedWindow(model),
+      });
+    }
     const { injectionDetector, constitutionalAI, contextManager } = this.state;
     return [
       ...(this.piiLayer ? [this.piiLayer] : []),
@@ -527,7 +543,50 @@ export class Cogitator implements ToolInvoker {
       ...(constitutionalAI ? [guardrailsMiddleware(constitutionalAI)] : []),
       ...(this.clearingLayer ? [this.clearingLayer] : []),
       ...(contextManager ? [compactionMiddleware(contextManager)] : []),
+      ...(this.memoryCompactionLayer ? [this.memoryCompactionLayer] : []),
     ];
+  }
+
+  /**
+   * A summarizer that asks `model`, routed as a run's model is (see {@link route}), with the
+   * prompt as its system message. Each call stops with the run's `signal` and is counted for
+   * `run`, in the cost router and in the usage the run returns.
+   */
+  private summarizerFor(model: string, { signal, ...run }: CompactionRun): SummarizeFn {
+    return async (messages, options) => {
+      signal?.throwIfAborted();
+      const { backend, model: name } = this.route(model);
+      const response = await backend.chat({
+        model: name,
+        messages: [
+          { role: 'system', content: options?.prompt ?? 'Summarize the conversation.' },
+          ...messages,
+        ],
+        ...(signal && { signal }),
+      });
+      const priced = this.pricedModel(model);
+      const priceOf = response.usage.cost ?? this.pricer.costOrNull(priced, response.usage);
+      if (priceOf === null) this.pricer.noteUnpriced(priced);
+      const cost = priceOf ?? 0;
+      this.getCostRouter()?.recordCost({
+        ...run,
+        model: priced,
+        inputTokens: response.usage.inputTokens,
+        outputTokens: response.usage.outputTokens,
+        cost,
+      });
+      const spent = this.afterRunSpend.get(run.runId) ?? {
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 0,
+      };
+      this.afterRunSpend.set(run.runId, {
+        inputTokens: spent.inputTokens + response.usage.inputTokens,
+        outputTokens: spent.outputTokens + response.usage.outputTokens,
+        cost: spent.cost + cost,
+      });
+      return response.content;
+    };
   }
 
   /**
@@ -1781,9 +1840,29 @@ export class Cogitator implements ToolInvoker {
 
       if (prompt) await this.recordPrompt(prompt, result, Date.now() - startTime);
 
-      options.onRunComplete?.(result);
+      await runMemory.settled();
+      await pipeline.afterRun(
+        { result, model: fellBackTo ?? this.pricedModel(effectiveModel, routeProvider) },
+        middlewareContext()
+      );
+      const afterRun = this.afterRunSpend.get(runId);
+      this.afterRunSpend.delete(runId);
+      const finished: RunResult = afterRun
+        ? {
+            ...result,
+            usage: {
+              ...result.usage,
+              inputTokens: result.usage.inputTokens + afterRun.inputTokens,
+              outputTokens: result.usage.outputTokens + afterRun.outputTokens,
+              totalTokens: result.usage.totalTokens + afterRun.inputTokens + afterRun.outputTokens,
+              cost: result.usage.cost + afterRun.cost,
+            },
+          }
+        : result;
 
-      return result;
+      options.onRunComplete?.(finished);
+
+      return finished;
     } catch (error) {
       if (prompt) await this.recordPrompt(prompt, undefined, Date.now() - startTime);
       if (abortController.signal.aborted) {
