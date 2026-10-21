@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { InMemoryAdapter } from '../adapters/memory';
+import { BaseMemoryAdapter } from '../adapters/base';
 import type { Message } from '@cogitator-ai/types';
 
 describe('InMemoryAdapter', () => {
@@ -26,6 +27,14 @@ describe('InMemoryAdapter', () => {
 
       await adapter.disconnect();
       expect(adapter.stats.threads).toBe(0);
+    });
+
+    it('healthCheck succeeds', async () => {
+      const result = await adapter.healthCheck();
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toBeUndefined();
+      }
     });
   });
 
@@ -359,6 +368,60 @@ describe('InMemoryAdapter', () => {
   describe('provider property', () => {
     it('returns memory as provider', () => {
       expect(adapter.provider).toBe('memory');
+    });
+  });
+
+  describe('healthCheck', () => {
+    it('returns success for in-memory adapter', async () => {
+      const result = await adapter.healthCheck();
+      expect(result.success).toBe(true);
+    });
+  });
+
+  describe('BaseMemoryAdapter without healthCheck', () => {
+    it('does not define healthCheck so custom adapters remain unchecked', () => {
+      class CustomBaseAdapter extends BaseMemoryAdapter {
+        readonly provider = 'memory' as const;
+        async connect() {
+          return this.success(undefined);
+        }
+        async disconnect() {
+          return this.success(undefined);
+        }
+        async createThread() {
+          return this.failure('not implemented');
+        }
+        async getThread() {
+          return this.failure('not implemented');
+        }
+        async updateThread() {
+          return this.failure('not implemented');
+        }
+        async deleteThread() {
+          return this.failure('not implemented');
+        }
+        async listThreads() {
+          return this.failure('not implemented');
+        }
+        async addEntry() {
+          return this.failure('not implemented');
+        }
+        async getEntries() {
+          return this.failure('not implemented');
+        }
+        async getEntry() {
+          return this.failure('not implemented');
+        }
+        async deleteEntry() {
+          return this.failure('not implemented');
+        }
+        async clearThread() {
+          return this.failure('not implemented');
+        }
+      }
+
+      const custom = new CustomBaseAdapter();
+      expect((custom as { healthCheck?: unknown }).healthCheck).toBeUndefined();
     });
   });
 });

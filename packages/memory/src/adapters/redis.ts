@@ -765,6 +765,14 @@ export class RedisAdapter extends BranchingMemoryAdapter implements MemoryItemAd
     return this.success(undefined);
   }
 
+  async healthCheck(): Promise<MemoryResult<void>> {
+    if (!this.client) return this.failure('Not connected');
+    return this.run(async (client) => {
+      await client.ping();
+      return this.success(undefined);
+    });
+  }
+
   private key(type: string, id: string): string {
     return `${this.prefix}${type}:${id}`;
   }

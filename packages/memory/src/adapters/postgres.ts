@@ -65,7 +65,11 @@ type PoolClient = SqlQueryable & {
   release(destroy?: boolean): void;
 };
 
-type Pool = SqlQueryable & {
+type Pool = Omit<SqlQueryable, 'query'> & {
+  query(
+    queryTextOrConfig: string | { text: string; query_timeout?: number },
+    values?: unknown[]
+  ): Promise<{ rows: Record<string, unknown>[] }>;
   connect(): Promise<PoolClient>;
   end(): Promise<void>;
 };
@@ -643,6 +647,16 @@ export class PostgresAdapter
     } finally {
       this.pool = null;
       this.vectorStore = { available: false, reason: 'Not connected' };
+    }
+  }
+
+  async healthCheck(): Promise<MemoryResult<void>> {
+    if (!this.pool) return this.failure('Not connected');
+    try {
+      await this.pool.query({ text: 'SELECT 1', query_timeout: 3000 });
+      return this.success(undefined);
+    } catch (error) {
+      return this.failure(error instanceof Error ? error.message : String(error));
     }
   }
 

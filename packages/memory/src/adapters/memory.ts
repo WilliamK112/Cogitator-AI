@@ -84,6 +84,10 @@ export class InMemoryAdapter extends BranchingMemoryAdapter implements MemoryIte
     return this.success(undefined);
   }
 
+  async healthCheck(): Promise<MemoryResult<void>> {
+    return this.success(undefined);
+  }
+
   async createThread(
     agentId: string,
     metadata: Record<string, unknown> = {},

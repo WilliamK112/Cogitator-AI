@@ -1548,4 +1548,35 @@ describe('PostgresAdapter', () => {
       expect(() => freshAdapter.setVectorDimensions(NaN)).toThrow();
     });
   });
+
+  describe('healthCheck', () => {
+    it('returns success on connected adapter and queries SELECT 1 with 3s driver query_timeout', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+      const result = await adapter.healthCheck();
+      expect(result.success).toBe(true);
+      expect(mockPool.query).toHaveBeenCalledWith({ text: 'SELECT 1', query_timeout: 3000 });
+    });
+
+    it('returns failure when not connected', async () => {
+      const unconnected = new PostgresAdapter({
+        provider: 'postgres',
+        connectionString: 'postgresql://localhost:5432/db',
+      });
+      const result = await unconnected.healthCheck();
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toBe('Not connected');
+      }
+    });
+
+    it('returns failure when query times out with driver error', async () => {
+      const timeoutError = new Error('Query read timeout');
+      mockPool.query.mockRejectedValueOnce(timeoutError);
+      const result = await adapter.healthCheck();
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain('Query read timeout');
+      }
+    });
+  });
 });

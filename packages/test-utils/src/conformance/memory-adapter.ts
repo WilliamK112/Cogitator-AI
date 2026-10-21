@@ -42,6 +42,7 @@ export type MemoryAdapterScenario =
   | 'unserializable-values'
   | 'refuses-empty-thread-id'
   | 'reports-changes'
+  | 'health-check'
   | 'tree-appends-to-active-leaf'
   | 'tree-branches'
   | 'tree-path-pages'
@@ -602,6 +603,13 @@ const SCENARIOS: Record<MemoryAdapterScenario, (adapter: MemoryAdapter) => Promi
       await adapter.listThreads({ metadata: { "a'b": 'x' } }),
       'listThreads with a metadata key that is not a plain name'
     );
+  },
+
+  async 'health-check'(adapter) {
+    if (!adapter.healthCheck) return;
+    const result = await adapter.healthCheck();
+    assert.equal(result.success, true, 'healthCheck succeeds on a connected adapter');
+    assert.equal(result.data, undefined, 'healthCheck returns void data');
   },
 
   async 'tree-appends-to-active-leaf'(adapter) {

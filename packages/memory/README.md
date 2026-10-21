@@ -106,7 +106,7 @@ const memory = new InMemoryAdapter({
 await memory.connect();
 ```
 
-`maxEntries` (default 10000) counts each thread on its own. A full thread drops the oldest entry of a branch that is not active first, then the oldest of the active branch.
+`maxEntries` (default 10000) counts each thread on its own. A full thread drops the oldest entry of a branch that is not active first, then the oldest of the active branch. `healthCheck()` returns immediate success.
 
 ### Redis Adapter
 
@@ -125,7 +125,7 @@ const memory = new RedisAdapter({
 await memory.connect();
 ```
 
-Redis Cluster is supported via `cluster: { nodes: [{ host, port }] }`. In cluster mode the key prefix is wrapped in a hash tag (`'{cogitator}:'` by default, `'myapp:'` becomes `'{myapp}:'`) so all keys of the adapter live in one slot.
+Redis Cluster is supported via `cluster: { nodes: [{ host, port }] }`. In cluster mode the key prefix is wrapped in a hash tag (`'{cogitator}:'` by default, `'myapp:'` becomes `'{myapp}:'`) so all keys of the adapter live in one slot. `healthCheck()` runs `client.ping()` to verify connectivity.
 
 ### PostgreSQL Adapter
 
@@ -148,7 +148,7 @@ memory.vectorStatus(); // { available: true, dimensions: 1536 } or { available: 
 
 On `connect()` the adapter creates its tables and an HNSW cosine index on the embeddings, which works from the first row on (no training data needed). An `ivfflat` index left by an earlier version is replaced on the first connect after upgrading, see the [adapters docs](https://cogitator.app/docs/memory/adapters) for building the new index ahead of time on a large table. `search()` raises `hnsw.ef_search` to the requested limit and, on pgvector 0.8+, uses iterative scans, so large limits and filters still get every matching row. Vectors of 2001 to 4000 dimensions are indexed as `halfvec` (pgvector 0.7+), larger ones are searched without an index. The schema version is kept in `<schema>.cogitator_schema_migrations`, so a `connect()` changes tables only after an upgrade. Version 3 moves every row of `facts` into a memory item of its own slot and renames the table `facts_legacy`. Messages, tool calls, tool results and metadata are stored as `jsonb`.
 
-pgvector is only needed for embeddings. Without it, `connect()` still succeeds and threads, entries and facts work, while embedding operations return a failed result naming the reason (also logged at connect). An existing `embeddings` table keeps its vector size: an adapter without `dimensions` adopts it, one configured for another size reports the mismatch through `vectorStatus()` and the failed results instead of failing each search with a Postgres error.
+pgvector is only needed for embeddings. Without it, `connect()` still succeeds and threads, entries and facts work, while embedding operations return a failed result naming the reason (also logged at connect). An existing `embeddings` table keeps its vector size: an adapter without `dimensions` adopts it, one configured for another size reports the mismatch through `vectorStatus()` and the failed results instead of failing each search with a Postgres error. `healthCheck()` runs `SELECT 1` with a 3-second driver-level query timeout so stalled checks do not occupy connections indefinitely.
 
 ### SQLite Adapter
 
@@ -164,6 +164,8 @@ const memory = new SQLiteAdapter({
 await memory.connect();
 ```
 
+`healthCheck()` runs a lightweight `SELECT 1` statement.
+
 ### MongoDB Adapter
 
 ```typescript
@@ -178,7 +180,7 @@ const memory = new MongoDBAdapter({
 await memory.connect();
 ```
 
-Threads and entries live in the `<collectionPrefix>threads` and `<collectionPrefix>entries` collections (prefix `memory_` by default), indexed on `agentId` and `(threadId, createdAt)`. Fields left `undefined` are omitted from the stored documents, not stored as `null`. A failed `connect()` leaves the adapter disconnected, so a later `connect()` retries.
+Threads and entries live in the `<collectionPrefix>threads` and `<collectionPrefix>entries` collections (prefix `memory_` by default), indexed on `agentId` and `(threadId, createdAt)`. Fields left `undefined` are omitted from the stored documents, not stored as `null`. A failed `connect()` leaves the adapter disconnected, so a later `connect()` retries. `healthCheck()` executes `{ ping: 1 }` via `db.command()`.
 
 ### Qdrant Adapter (Embedding)
 
@@ -242,6 +244,7 @@ interface MemoryAdapter {
 
   connect(): Promise<MemoryResult<void>>;
   disconnect(): Promise<MemoryResult<void>>;
+  healthCheck?(): Promise<MemoryResult<void>>;
 
   createThread(agentId: string, metadata?: Record<string, unknown>): Promise<MemoryResult<Thread>>;
   getThread(threadId: string): Promise<MemoryResult<Thread | null>>;
@@ -266,7 +269,7 @@ interface MemoryAdapter {
 }
 ```
 
-The branch methods are optional on the interface, every built-in adapter implements them.
+The branch methods and `healthCheck()` are optional on the interface, and every built-in adapter implements them. Custom adapters can implement `healthCheck(): Promise<MemoryResult<void>>` to participate in server readiness checks (`GET /ready`). An adapter without `healthCheck()` reports `unchecked` and does not fail readiness. Built-in adapters deduplicate concurrent health checks so at most one check is in flight per adapter.
 
 ### Thread Operations
 
