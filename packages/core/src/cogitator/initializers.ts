@@ -13,6 +13,7 @@ import type {
 } from '@cogitator-ai/types';
 import {
   InMemoryAdapter,
+  InMemoryEmbeddingAdapter,
   RedisAdapter,
   PostgresAdapter,
   SQLiteAdapter,
@@ -71,6 +72,10 @@ export interface InitializerState {
   embeddingStore?: QdrantAdapter;
   contextBuilder?: ContextBuilder;
   messageIndex?: MessageIndex;
+  /** Memory items of the memory adapter, when it stores them */
+  memoryItems?: MemoryItems;
+  /** The counts of memory items sent to a model still being written */
+  retrievalCounts?: Promise<void>;
   memoryInitialized: boolean;
   sandboxManager?: SandboxManager;
   sandboxInitialized: boolean;
@@ -119,16 +124,29 @@ export async function initializeMemory(
       ...memory.contextBuilder,
       strategy: memory.contextBuilder.strategy ?? 'recent',
       includeSystemPrompt: true,
+      ...(memory.contextBuilder.timeZone === undefined &&
+        memory.extraction?.timeZone !== undefined && { timeZone: memory.extraction.timeZone }),
     } as const;
     const messageIndex =
       contextConfig.strategy !== 'recent' && embeddingService
-        ? indexFor(adapter, embeddingAdapter, embeddingService)
+        ? adapter instanceof InMemoryAdapter
+          ? indexFor(adapter, new InMemoryEmbeddingAdapter(), embeddingService)
+          : embeddingAdapter
+            ? indexFor(adapter, embeddingAdapter, embeddingService)
+            : indexFor(
+                adapter,
+                new InMemoryEmbeddingAdapter(),
+                embeddingService,
+                IN_PROCESS_INDEX_VECTORS
+              )
         : undefined;
     state.messageIndex = messageIndex;
+    state.memoryItems = isMemoryItemAdapter(adapter) ? new MemoryItems({ adapter }) : undefined;
     const deps: ContextBuilderDeps = {
       memoryAdapter: adapter,
       ...(isFactAdapter(adapter) && { factAdapter: adapter }),
-      ...(isMemoryItemAdapter(adapter) && { memoryItems: new MemoryItems({ adapter }) }),
+      ...(state.memoryItems && { memoryItems: state.memoryItems }),
+      ...(memory.reranker && { reranker: memory.reranker }),
       ...(embeddingAdapter && { embeddingAdapter }),
       ...(embeddingService && { embeddingService }),
       ...(messageIndex && { messageIndex }),
@@ -145,22 +163,30 @@ export async function initializeMemory(
 }
 
 /**
- * The index keeping a vector per history entry for the `relevant` and `hybrid` strategies, in
- * the embedding store. The in-process `memory` adapter gets none: its entries live as long as the
- * process, and the context builder keeps their vectors in process too, while a store outside
- * would keep vectors of entries a restart forgot. Background failures are logged, as no run
- * waits on them.
+ * Vectors a lasting memory without an embedding store keeps in process, those of the threads
+ * used least lately dropped past it
+ */
+const IN_PROCESS_INDEX_VECTORS = 50_000;
+
+/**
+ * The index that embeds each entry of `adapter` once, its vectors in `store`: the configured
+ * embedding store, or one in process for a memory with none or one in process itself (whose
+ * entries would leave vectors behind in a lasting store), so `relevant` and `hybrid` search a
+ * whole thread instead of its newest entries on every memory. A lasting memory indexed in
+ * process keeps up to {@link IN_PROCESS_INDEX_VECTORS} vectors, of the threads used lately, so
+ * the process does not grow with every thread it ever read. Background failures are logged, as no run waits on them.
  */
 function indexFor(
   adapter: MemoryAdapter,
-  store: EmbeddingAdapter | undefined,
-  embedding: EmbeddingService
-): MessageIndex | undefined {
-  if (!store || adapter instanceof InMemoryAdapter) return undefined;
+  store: EmbeddingAdapter,
+  embedding: EmbeddingService,
+  vectorsKept?: number
+): MessageIndex {
   const logger = getLogger();
   const index = new MessageIndex({
     store,
     embedding,
+    ...(vectorsKept !== undefined && { vectorsKept }),
     onError: (error) =>
       logger.warn('Indexing memory entries failed', { operation: 'index', error: error.message }),
   });
@@ -438,10 +464,15 @@ export function initializeContextManager(
 }
 
 export async function cleanupState(state: InitializerState): Promise<void> {
+  for (let pending = state.retrievalCounts; pending; pending = state.retrievalCounts) {
+    await pending;
+    if (state.retrievalCounts === pending) state.retrievalCounts = undefined;
+  }
   if (state.messageIndex) {
     await state.messageIndex.close();
     state.messageIndex = undefined;
   }
+  state.memoryItems = undefined;
   if (state.memoryAdapter) {
     await state.memoryAdapter.disconnect();
     state.memoryAdapter = undefined;

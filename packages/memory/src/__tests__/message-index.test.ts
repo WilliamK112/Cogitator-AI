@@ -207,6 +207,64 @@ describe('MessageIndex', () => {
     expect(embedding.embedBatch).not.toHaveBeenCalled();
   });
 
+  it('keeps the vectors of the threads used lately and indexes a dropped one again', async () => {
+    index = new MessageIndex({ store, embedding, vectorsKept: 2 });
+    index.attach(memory);
+    await memory.createThread('agent', {}, 'thread-2');
+    await memory.createThread('agent', {}, 'thread-3');
+    const first = await say('cat in the first thread');
+    const second = await say('tax in the second', 'user', 'thread-2');
+    await index.flush();
+    await index.search('thread-2', topicVector('tax'), 5, 0);
+    const third = await say('car in the third', 'user', 'thread-3');
+    await index.flush();
+
+    expect(await storedSources()).toEqual([second.id, third.id].sort());
+
+    const text = {
+      entryId: first.id,
+      threadId,
+      role: 'user' as const,
+      text: first.message.content as string,
+    };
+    await index.vectorsOf([text]);
+    await index.flush();
+    expect(await storedSources()).toEqual([first.id, third.id].sort());
+  });
+
+  it('keeps the vectors of the thread written last when threads interleave past the limit', async () => {
+    index = new MessageIndex({ store, embedding, vectorsKept: 1 });
+    index.attach(memory);
+    await memory.createThread('agent', {}, 'thread-2');
+    await say('cat a1');
+    await say('tax b1', 'user', 'thread-2');
+    await say('cat a2');
+    const last = await say('tax b2', 'user', 'thread-2');
+    await index.flush();
+
+    expect(await storedSources()).toEqual([last.id]);
+  });
+
+  it('fails an explicit index when the store refuses a vector', async () => {
+    const entry = await say('cat refused');
+    await index.flush();
+    await store.deleteBySource(entry.id);
+    const refused = vi
+      .spyOn(store, 'replaceBySource')
+      .mockResolvedValue({ success: false, error: 'down' });
+    index = new MessageIndex({ store, embedding });
+    const text = { entryId: entry.id, threadId, role: 'user' as const, text: 'cat refused' };
+
+    await expect(index.index([text])).rejects.toThrow(/down/);
+    refused.mockRestore();
+    await index.index([text]);
+    expect(await storedSources()).toEqual([entry.id]);
+  });
+
+  it('is refused fewer than one vector kept', () => {
+    expect(() => new MessageIndex({ store, embedding, vectorsKept: 0 })).toThrow(/vectorsKept/);
+  });
+
   it('is refused a batch size below one', () => {
     expect(() => new MessageIndex({ store, embedding, batchSize: 0 })).toThrow(/batchSize/);
   });
@@ -412,13 +470,22 @@ describe('MessageIndex against races and other users', () => {
     for (let i = 0; i < 80; i++) await entryIn('t', `cat ${i}`);
     await index.flush();
     const builder = new ContextBuilder(
-      { maxTokens: 400, reserveTokens: 0, strategy: 'hybrid', includeSystemPrompt: false },
+      {
+        maxTokens: 400,
+        reserveTokens: 0,
+        strategy: 'hybrid',
+        includeSystemPrompt: false,
+        partitions: { recall: { share: 0.35 } },
+      },
       { memoryAdapter: memory, embeddingService: embedding, messageIndex: index }
     );
 
     const context = await builder.build({ threadId: 't', agentId: 'agent', currentInput: 'cat' });
 
-    expect(context.messages.map((m) => m.content)).toContain('my cat is called Whiskers the great');
+    expect(context.memoryContext).toContain('my cat is called Whiskers the great');
+    expect(context.recalled?.entries.map((entry) => entry.message.content)).toContain(
+      'my cat is called Whiskers the great'
+    );
   });
 
   it('writes a vector again when a build needs it after the store failed to keep it', async () => {

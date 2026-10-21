@@ -101,13 +101,25 @@ export interface MemoryItem {
   supersedes?: string[];
   /** The item of its slot that closed it */
   supersededBy?: string;
+  /** Times it went to a model in a context, counted once a run that sent it finished */
+  timesRetrieved?: number;
+  /** When it last went to a model */
+  lastRetrievedAt?: Date;
   metadata?: Record<string, unknown>;
 }
 
 /** A memory item to write: memory gives it its id, status and record time */
 export type NewMemoryItem = Omit<
   MemoryItem,
-  'id' | 'status' | 'recordedAt' | 'supersedes' | 'supersededBy' | 'expiredAt' | 'verified'
+  | 'id'
+  | 'status'
+  | 'recordedAt'
+  | 'supersedes'
+  | 'supersededBy'
+  | 'expiredAt'
+  | 'verified'
+  | 'timesRetrieved'
+  | 'lastRetrievedAt'
 > & {
   /** Overrides the status memory would give it, such as `active` for an item the user confirmed */
   status?: MemoryItemStatus;
@@ -175,6 +187,13 @@ export interface MemoryItemAdapter {
   findItems(filter: MemoryItemFilter): Promise<MemoryResult<MemoryItem[]>>;
   /** Deletes the items for good */
   deleteItems(itemIds: string[]): Promise<MemoryResult<void>>;
+  /**
+   * Counts the items with these ids as retrieved once more at `at` (`timesRetrieved` one up,
+   * `lastRetrievedAt` set), each in one step of the store: an item that does not exist is not
+   * written, and no other field of an item changes. Without it, `MemoryItems` reads and writes
+   * each item back under a lock of its own process.
+   */
+  countRetrieved?(itemIds: string[], at: Date): Promise<MemoryResult<void>>;
   /** Writes `entity`, replacing the entity with its id */
   putEntity(entity: MemoryEntity): Promise<MemoryResult<MemoryEntity>>;
   findEntities(filter: MemoryEntityFilter): Promise<MemoryResult<MemoryEntity[]>>;

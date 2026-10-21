@@ -60,6 +60,40 @@ export function visibleIn(item: Pick<MemoryItem, 'scope'>, scope: MemoryItemScop
   );
 }
 
+/** How narrow a scope is: a thread's items over a user's, a user's over the agent's */
+function narrowness(item: MemoryItem): number {
+  return (
+    (item.scope.threadId !== undefined ? 4 : 0) +
+    (item.scope.projectId !== undefined ? 2 : 0) +
+    (item.scope.userId !== undefined ? 1 : 0)
+  );
+}
+
+/** Whether state `a` of a slot wins over `b`: it started later, or together in a narrower scope */
+function laterState(a: MemoryItem, b: MemoryItem): boolean {
+  const since = (a.validFrom?.getTime() ?? 0) - (b.validFrom?.getTime() ?? 0);
+  return since !== 0 ? since > 0 : narrowness(a) > narrowness(b);
+}
+
+/**
+ * `items` with one item per slot: the one that started to hold last, of the narrowest scope when
+ * two started together, since a run sees a slot's states of its thread, its user and the agent
+ * at once
+ */
+export function onePerSlot(items: readonly MemoryItem[]): MemoryItem[] {
+  const bySlot = new Map<string, MemoryItem>();
+  const kept: MemoryItem[] = [];
+  for (const item of items) {
+    if (item.slot === undefined) {
+      kept.push(item);
+      continue;
+    }
+    const known = bySlot.get(item.slot);
+    if (!known || laterState(item, known)) bySlot.set(item.slot, item);
+  }
+  return [...kept, ...bySlot.values()];
+}
+
 /** The fields of a scope that narrow its agent, which `visibleTo` and `scope` filters compare */
 const SCOPE_FIELDS = ['userId', 'projectId', 'threadId'] as const;
 
@@ -598,21 +632,65 @@ export class MemoryItems {
 
   /** Deletes items for good, such as everything a user asked to be forgotten */
   async purge(itemIds: readonly string[]): Promise<void> {
-    if (itemIds.length > 0) unwrap(await this.adapter.deleteItems([...itemIds]));
+    for (const [agentId, ids] of await this.idsByAgent(itemIds)) {
+      await this.exclusive(agentId, async () => unwrap(await this.adapter.deleteItems(ids)));
+    }
+  }
+
+  /**
+   * Counts `itemIds` as gone to a model once more, at `at`: what a run sent in its context, once
+   * the run finished or paused for approval, so an item read but never sent does not count
+   */
+  async noteRetrieved(itemIds: readonly string[], at: Date = this.now()): Promise<void> {
+    const ids = [...new Set(itemIds)];
+    if (ids.length === 0) return;
+    const countRetrieved = this.adapter.countRetrieved?.bind(this.adapter);
+    if (countRetrieved) {
+      for (const [agentId, owned] of await this.idsByAgent(ids)) {
+        await this.exclusive(agentId, async () => unwrap(await countRetrieved(owned, at)));
+      }
+      return;
+    }
+    await this.update(ids, (item) => ({
+      ...item,
+      timesRetrieved: (item.timesRetrieved ?? 0) + 1,
+      lastRetrievedAt: at,
+    }));
   }
 
   async get(itemId: string): Promise<MemoryItem | null> {
     return unwrap(await this.adapter.getItem(itemId));
   }
 
+  /**
+   * Changes the items under the lock of their agent, each read again under it in one call, so a
+   * change never writes back an older state of an item, nor one purged meanwhile
+   */
   private async update(
     itemIds: readonly string[],
     change: (item: MemoryItem) => MemoryItem
   ): Promise<void> {
-    for (const itemId of itemIds) {
-      const item = unwrap(await this.adapter.getItem(itemId));
-      if (item) unwrap(await this.adapter.putItem(change(item)));
+    for (const [agentId, ids] of await this.idsByAgent(itemIds)) {
+      await this.exclusive(agentId, async () => {
+        const items = unwrap(await this.adapter.findItems({ agentId, ids, includeExpired: true }));
+        for (const item of items) unwrap(await this.adapter.putItem(change(item)));
+      });
     }
+  }
+
+  /** The distinct ids of the items that exist among `itemIds`, by the agent they belong to */
+  private async idsByAgent(itemIds: readonly string[]): Promise<Map<string, string[]>> {
+    const items = await Promise.all(
+      [...new Set(itemIds)].map(async (itemId) => unwrap(await this.adapter.getItem(itemId)))
+    );
+    const byAgent = new Map<string, string[]>();
+    for (const item of items) {
+      if (!item) continue;
+      const ids = byAgent.get(item.scope.agentId);
+      if (ids) ids.push(item.id);
+      else byAgent.set(item.scope.agentId, [item.id]);
+    }
+    return byAgent;
   }
 }
 

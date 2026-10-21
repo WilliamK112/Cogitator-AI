@@ -51,7 +51,16 @@ import { createLLMBackendFromPlugin, hasLLMPlugin } from './llm/plugin';
 import { withLLMRetry } from './llm/retry';
 import { ModelFallbackChain, type ModelCandidate } from './llm/model-fallback';
 import { modelContextWindow } from './context/model-window';
-import { countMessagesTokens, countTokens, type SummarizeFn } from '@cogitator-ai/memory';
+import {
+  countMessagesTokens,
+  countTokens,
+  indexedText,
+  type IndexedText,
+  type SummarizeFn,
+} from '@cogitator-ai/memory';
+
+/** Entries of a thread {@link Cogitator.indexMemory} reads at once */
+const INDEX_PAGE = 500;
 import { TruncateStrategy } from './context/strategies/index';
 import { sanitizeToolHistory } from './utils/tool-history';
 import { normalizeTurn } from './llm/turn';
@@ -911,6 +920,7 @@ export class Cogitator implements ToolInvoker {
       let input: string;
       let messages: Message[];
       let contextPartitions: BuiltContext['partitions'] | undefined;
+      let sentItemIds: string[] = [];
 
       if (checkpoint) {
         input = checkpoint.input;
@@ -965,7 +975,13 @@ export class Cogitator implements ToolInvoker {
               pipeline.beforeRun({ input, messages: initial }, middlewareContext()),
               abortController.signal
             ),
-          (built) => (contextPartitions = built.partitions)
+          (built) => {
+            contextPartitions = built.partitions;
+            sentItemIds = [
+              ...built.facts.map((fact) => fact.id),
+              ...(built.recalled?.items.map((item) => item.id) ?? []),
+            ];
+          }
         );
       }
 
@@ -1742,6 +1758,7 @@ export class Cogitator implements ToolInvoker {
           messages: restoreClearedOutputs(messages, middlewareState),
           trace: { traceId, spans: publicSpans() },
         };
+        if (sentItemIds.length > 0) this.noteRetrieved(sentItemIds, runId);
         options.onRunComplete?.(paused);
         return paused;
       }
@@ -1852,6 +1869,7 @@ export class Cogitator implements ToolInvoker {
       if (prompt) await this.recordPrompt(prompt, result, Date.now() - startTime);
 
       await runMemory.settled();
+      if (sentItemIds.length > 0) this.noteRetrieved(sentItemIds, runId);
       await pipeline.afterRun(
         {
           result,
@@ -2657,6 +2675,41 @@ export class Cogitator implements ToolInvoker {
   }
 
   /**
+   * Embeds every entry of `threadId` the memory index has not embedded yet and waits until their
+   * vectors are stored, such as after a conversation was imported, so the first search of the
+   * thread already sees all of it. With an adapter that reads a thread in pages (`getPath`) the
+   * thread is read and embedded a page at a time, so a long one is never held whole, else it is
+   * read at once and embedded a page at a time. Does nothing when memory keeps no index (the `recent` strategy or no
+   * embedding service). Fails when the embedding store refuses a vector.
+   */
+  async indexMemory(threadId: string): Promise<void> {
+    const memory = await this.getMemory();
+    const index = this.state.messageIndex;
+    if (!memory || !index) return;
+    let before: string | undefined;
+    for (;;) {
+      const seenAt = index.mark();
+      const page = memory.getPath
+        ? await memory.getPath({
+            threadId,
+            limit: INDEX_PAGE,
+            ...(before !== undefined && { before }),
+          })
+        : await memory.getEntries({ threadId });
+      if (!page.success) throw new Error(page.error);
+      const texts: IndexedText[] = page.data.flatMap((entry) => indexedText(entry) ?? []);
+      for (let start = 0; start < texts.length; start += INDEX_PAGE) {
+        await index.index(texts.slice(start, start + INDEX_PAGE), seenAt);
+        await index.flush();
+      }
+      const first = page.data[0];
+      if (!memory.getPath || !first || page.data.length < INDEX_PAGE) break;
+      before = first.id;
+    }
+    await index.flush();
+  }
+
+  /**
    * The memory adapter once connected: by a run, by {@link getMemory}, or
    * set here. `undefined` before then — use `getMemory()` to connect it.
    */
@@ -2675,6 +2728,23 @@ export class Cogitator implements ToolInvoker {
 
   get reflectionEngine() {
     return this.state.reflectionEngine;
+  }
+
+  /**
+   * Counts the memory items a run sent in the background, one count after another, so the run
+   * returns without waiting on the writes; `close` waits for them
+   */
+  private noteRetrieved(itemIds: readonly string[], runId: string): void {
+    const items = this.state.memoryItems;
+    if (!items) return;
+    this.state.retrievalCounts = (this.state.retrievalCounts ?? Promise.resolve())
+      .then(() => items.noteRetrieved(itemIds))
+      .catch((error: unknown) =>
+        getLogger().warn('Could not count the memory items a run sent', {
+          runId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      );
   }
 
   /**

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { ContextBuilder } from '../context-builder';
 import { InMemoryAdapter } from '../adapters/memory';
 import { MemoryItems } from '../memory-items';
-import type { Message, GraphNode, GraphEdge, GraphContext } from '@cogitator-ai/types';
+import type { Message, GraphNode, GraphEdge, GraphContext, Reranker } from '@cogitator-ai/types';
 import type { GraphContextBuilder } from '../knowledge-graph/graph-context-builder';
 
 describe('ContextBuilder', () => {
@@ -315,6 +315,464 @@ describe('ContextBuilder', () => {
       expect(result.memoryContext).toContain(
         'Known facts:\n- Answer Ana in Portuguese\n- Ana lives in Lisbon (previously: Porto)'
       );
+    });
+  });
+
+  describe('hybrid recall', () => {
+    it('keeps the tail as history and brings older turns and items as memory of the turn', async () => {
+      const day = (n: number) => new Date(Date.UTC(2026, 2, n, 9));
+      const say = async (role: 'user' | 'assistant', content: string, n: number) =>
+        adapter.addEntry({
+          threadId,
+          message: { role, content },
+          tokenCount: 1,
+          createdAt: day(n),
+        });
+      await say('user', 'I adopted a dog named Rex from the shelter', 1);
+      await say('assistant', 'Congratulations on Rex!', 1);
+      for (let n = 0; n < 40; n++) {
+        await say('user', `Let us plan the garden bed number ${n} together`, 2);
+        await say('assistant', `Bed ${n} gets tomatoes and basil this year`, 2);
+      }
+      const items = new MemoryItems({ adapter });
+      const base = {
+        trust: 'user' as const,
+        confidence: 0.9,
+        evidence: [],
+        verified: true,
+        saidAt: day(1),
+        scope: { agentId: 'agent1', userId: 'u1' },
+      };
+      await items.write([
+        {
+          ...base,
+          kind: 'fact',
+          content: 'Ana lived in Porto',
+          subject: 'Ana',
+          attribute: 'city',
+          value: 'Porto',
+          sessionAt: day(1),
+        },
+        {
+          ...base,
+          kind: 'fact',
+          content: 'Ana lives in Lisbon',
+          subject: 'Ana',
+          attribute: 'city',
+          value: 'Lisbon',
+          sessionAt: day(3),
+        },
+        { ...base, kind: 'event', content: 'Rex had his first vet visit', sessionAt: day(1) },
+      ]);
+      const builder = new ContextBuilder(
+        { maxTokens: 1200, strategy: 'hybrid', includeFacts: true },
+        { memoryAdapter: adapter, memoryItems: items }
+      );
+
+      const result = await builder.build({
+        threadId,
+        agentId: 'agent1',
+        userId: 'u1',
+        currentInput: 'What is my dog Rex like?',
+        asOf: day(10),
+      });
+
+      const history = result.messages.filter((m) => m.role !== 'system').slice(0, -1);
+      expect(history.some((m) => String(m.content).includes('Rex'))).toBe(false);
+      expect(result.memoryContext).toContain(
+        'Earlier in this conversation:\n[2026-03-01] user: I adopted a dog named Rex from the shelter\n[2026-03-01] assistant: Congratulations on Rex!'
+      );
+      expect(result.memoryContext?.match(/I adopted a dog named Rex/g)).toHaveLength(1);
+      expect(result.facts.map((fact) => fact.content)).toContain('Rex had his first vet visit');
+      expect(result.recalled?.items.map((item) => item.content) ?? []).not.toContain(
+        'Rex had his first vet visit'
+      );
+
+      const before = await builder.build({
+        threadId,
+        agentId: 'agent1',
+        userId: 'u1',
+        currentInput: 'Where did Ana live before Lisbon?',
+        asOf: day(10),
+      });
+      expect(before.memoryContext).toContain(
+        'From memory:\n- Ana lived in Porto (2026-03-01 to 2026-03-03)'
+      );
+    });
+  });
+
+  describe('hybrid recall share', () => {
+    it('recalls into 60% of the budget by default, within what the other shares leave', () => {
+      const shareOf = (builder: ContextBuilder) =>
+        (builder as unknown as { config: { partitions: { recall?: { share?: number } } } }).config
+          .partitions.recall?.share;
+      expect(shareOf(new ContextBuilder({ strategy: 'hybrid' }, { memoryAdapter: adapter }))).toBe(
+        0.6
+      );
+      expect(
+        shareOf(
+          new ContextBuilder(
+            { strategy: 'hybrid', partitions: { facts: { share: 0.5 } } },
+            { memoryAdapter: adapter }
+          )
+        )
+      ).toBe(0.5);
+      expect(
+        shareOf(
+          new ContextBuilder(
+            { strategy: 'hybrid', partitions: { recall: { share: 0.2 } } },
+            { memoryAdapter: adapter }
+          )
+        )
+      ).toBe(0.2);
+      expect(
+        shareOf(new ContextBuilder({ strategy: 'relevant' }, { memoryAdapter: adapter }))
+      ).toBeUndefined();
+    });
+  });
+
+  describe('hybrid recall at the edge of the history', () => {
+    it('searches every turn the history does not keep', async () => {
+      const filler =
+        'the code review ran late and the tram was late again, my code is fine '.repeat(6);
+      for (let n = 0; n < 30; n++) {
+        const content = n === 27 ? `My locker code is 4471. ${filler}` : `${n} ${filler}`;
+        await adapter.addEntry({
+          threadId,
+          message: { role: n % 2 ? 'assistant' : 'user', content },
+          tokenCount: 90,
+        });
+      }
+      const builder = new ContextBuilder(
+        { maxTokens: 1000, reserveTokens: 0, strategy: 'hybrid' },
+        { memoryAdapter: adapter }
+      );
+
+      const result = await builder.build({
+        threadId,
+        agentId: 'agent1',
+        currentInput: 'What is my locker code?',
+      });
+
+      const history = result.messages.map((message) => String(message.content)).join('\n');
+      expect(`${history}\n${result.memoryContext ?? ''}`).toContain('4471');
+    });
+  });
+
+  describe('hybrid recall in a time zone', () => {
+    it('shows and reads dates on the calendar of the thread', async () => {
+      const say = async (role: 'user' | 'assistant', content: string, at: string) =>
+        adapter.addEntry({
+          threadId,
+          message: { role, content },
+          tokenCount: 1,
+          createdAt: new Date(at),
+        });
+      await say('user', 'I mailed the parcel to Porto', '2026-03-09T23:30:00Z');
+      await say('assistant', 'Hope it arrives soon', '2026-03-09T23:31:00Z');
+      for (let n = 0; n < 40; n++) {
+        await say(
+          'user',
+          `Let us plan the garden bed number ${n} together`,
+          '2026-03-11T09:00:00Z'
+        );
+        await say(
+          'assistant',
+          `Bed ${n} gets tomatoes and basil this year`,
+          '2026-03-11T09:00:00Z'
+        );
+      }
+      const builder = new ContextBuilder(
+        { maxTokens: 1200, strategy: 'hybrid', timeZone: 'America/New_York' },
+        { memoryAdapter: adapter }
+      );
+      const asOf = new Date('2026-03-12T12:00:00Z');
+
+      const inBuilderZone = await builder.build({
+        threadId,
+        agentId: 'agent1',
+        currentInput: 'What did I do on March 9?',
+        asOf,
+      });
+      expect(inBuilderZone.memoryContext).toContain(
+        '[2026-03-09] user: I mailed the parcel to Porto'
+      );
+
+      const inThreadZone = await builder.build({
+        threadId,
+        agentId: 'agent1',
+        currentInput: 'What did I do on March 10?',
+        asOf,
+        timeZone: 'Asia/Tokyo',
+      });
+      expect(inThreadZone.memoryContext).toContain(
+        '[2026-03-10] user: I mailed the parcel to Porto'
+      );
+    });
+
+    it('shows a month resolved in another zone as that month', async () => {
+      const items = new MemoryItems({ adapter });
+      await items.write([
+        {
+          kind: 'event',
+          content: 'Ana moved to Lisbon',
+          trust: 'user',
+          confidence: 0.9,
+          evidence: [],
+          verified: true,
+          scope: { agentId: 'agent1', userId: 'u1' },
+          about: {
+            text: 'in March',
+            start: new Date('2024-02-29T15:00:00Z'),
+            end: new Date('2024-03-31T15:00:00Z'),
+            precision: 'month',
+          },
+          saidAt: new Date('2024-04-02'),
+          sessionAt: new Date('2024-04-02'),
+        },
+      ]);
+      const builder = new ContextBuilder(
+        { maxTokens: 2000, strategy: 'hybrid', timeZone: 'America/New_York' },
+        { memoryAdapter: adapter, memoryItems: items }
+      );
+
+      const result = await builder.build({
+        threadId,
+        agentId: 'agent1',
+        userId: 'u1',
+        currentInput: 'When did Ana move to Lisbon?',
+        asOf: new Date('2024-05-01'),
+      });
+
+      expect(result.memoryContext).toContain('- Ana moved to Lisbon (2024-03)');
+    });
+
+    it('refuses a time zone that is not one', () => {
+      expect(
+        () =>
+          new ContextBuilder(
+            { strategy: 'hybrid', timeZone: 'Mars/Olympus' },
+            { memoryAdapter: adapter }
+          )
+      ).toThrow(/IANA time zone/);
+    });
+  });
+
+  describe('hybrid recall under pressure', () => {
+    const base = {
+      trust: 'user' as const,
+      confidence: 0.9,
+      evidence: [],
+      verified: true,
+      scope: { agentId: 'agent1', userId: 'u1' },
+    };
+
+    it('reads memory items as of the moment the turn is read at', async () => {
+      const items = new MemoryItems({ adapter });
+      const city = (value: string, at: string) => ({
+        ...base,
+        kind: 'fact' as const,
+        content: `Ana lives in ${value}`,
+        subject: 'Ana',
+        attribute: 'city',
+        value,
+        saidAt: new Date(at),
+        sessionAt: new Date(at),
+      });
+      await items.write([city('Porto', '2024-01-01'), city('Lisbon', '2025-01-01')]);
+      const builder = new ContextBuilder(
+        { maxTokens: 2000, strategy: 'hybrid', includeFacts: true },
+        { memoryAdapter: adapter, memoryItems: items }
+      );
+
+      const result = await builder.build({
+        threadId,
+        agentId: 'agent1',
+        userId: 'u1',
+        currentInput: 'Where does Ana live?',
+        asOf: new Date('2024-06-01'),
+      });
+
+      expect(result.facts.map((fact) => fact.content)).toEqual(['Ana lives in Porto']);
+    });
+
+    it('shows what an item superseded when it was still known at the moment read at', async () => {
+      const items = new MemoryItems({ adapter });
+      const city = (value: string, at: string) => ({
+        ...base,
+        kind: 'fact' as const,
+        content: `Ana lives in ${value}`,
+        subject: 'Ana',
+        attribute: 'city',
+        value,
+        saidAt: new Date(at),
+        sessionAt: new Date(at),
+      });
+      const [porto] = await items.write([
+        city('Porto', '2024-01-01'),
+        city('Lisbon', '2025-01-01'),
+      ]);
+      await items.expire([porto!.id], new Date('2025-06-01'));
+      const builder = new ContextBuilder(
+        { maxTokens: 2000, strategy: 'recent', includeFacts: true },
+        { memoryAdapter: adapter, memoryItems: items }
+      );
+      const at = (asOf: string) =>
+        builder.build({
+          threadId,
+          agentId: 'agent1',
+          userId: 'u1',
+          currentInput: 'Where does Ana live?',
+          asOf: new Date(asOf),
+        });
+
+      expect((await at('2025-03-01')).memoryContext).toContain(
+        'Ana lives in Lisbon (previously: Porto)'
+      );
+      const later = await at('2025-09-01');
+      expect(later.memoryContext).toContain('Ana lives in Lisbon');
+      expect(later.memoryContext).not.toContain('previously');
+    });
+
+    it('recalls the slot state the facts choose, under both ids of the agent', async () => {
+      const items = new MemoryItems({ adapter });
+      const city = (value: string, scope: object, at: string) => ({
+        ...base,
+        kind: 'fact' as const,
+        content: `Ana lives in ${value}`,
+        subject: 'Ana',
+        attribute: 'city',
+        value,
+        scope: { agentId: 'runtime-id', ...scope },
+        saidAt: new Date(at),
+        sessionAt: new Date(at),
+      });
+      await items.write([
+        city('Lisbon', { userId: 'u1' }, '2025-01-01'),
+        city('Faro', { userId: 'u1', threadId }, '2025-01-01'),
+        {
+          ...base,
+          kind: 'event',
+          content: 'Ana went sailing near Faro',
+          scope: { agentId: 'runtime-id', userId: 'u1' },
+          about: { text: 'last Friday', start: new Date('2025-01-03'), precision: 'day' as const },
+          saidAt: new Date('2025-01-06'),
+          sessionAt: new Date('2025-01-06'),
+        },
+      ]);
+      const builder = new ContextBuilder(
+        { maxTokens: 2000, strategy: 'hybrid' },
+        { memoryAdapter: adapter, memoryItems: items }
+      );
+
+      const result = await builder.build({
+        threadId,
+        agentId: 'runtime-id',
+        memoryAgentId: 'concierge',
+        userId: 'u1',
+        currentInput: 'Where does Ana live now, and what did she do near Faro?',
+        asOf: new Date('2025-02-01'),
+      });
+
+      expect(result.memoryContext).toContain('- Ana lives in Faro');
+      expect(result.memoryContext).not.toContain('Lisbon');
+      expect(result.memoryContext).toContain('- Ana went sailing near Faro (2025-01-03)');
+    });
+
+    it('recalls a fact the facts partition had no room for', async () => {
+      const items = new MemoryItems({ adapter });
+      await items.write([
+        {
+          ...base,
+          kind: 'fact',
+          content: 'Rex is a golden retriever',
+          saidAt: new Date('2024-01-01'),
+          sessionAt: new Date('2024-01-01'),
+        },
+        ...Array.from({ length: 70 }, (_, n) => ({
+          ...base,
+          kind: 'fact' as const,
+          content: `Unrelated note number ${n} about the garden plan`,
+          saidAt: new Date('2025-01-01'),
+          sessionAt: new Date('2025-01-01'),
+        })),
+      ]);
+      const builder = new ContextBuilder(
+        { maxTokens: 1500, strategy: 'hybrid', includeFacts: true },
+        { memoryAdapter: adapter, memoryItems: items }
+      );
+
+      const result = await builder.build({
+        threadId,
+        agentId: 'agent1',
+        userId: 'u1',
+        currentInput: 'What breed is Rex?',
+      });
+
+      expect(result.memoryContext).toContain('Rex is a golden retriever');
+    });
+
+    it('searches the turns a large system prompt pushes out of the tail', async () => {
+      await adapter.addEntry({
+        threadId,
+        message: { role: 'user', content: 'The door code is 4417' },
+        tokenCount: 1,
+      });
+      for (let n = 0; n < 4; n++) {
+        await adapter.addEntry({
+          threadId,
+          message: { role: 'user', content: `Some chatter about the weather number ${n}` },
+          tokenCount: 1,
+        });
+      }
+      const builder = new ContextBuilder(
+        { maxTokens: 1000, reserveTokens: 0, strategy: 'hybrid' },
+        { memoryAdapter: adapter }
+      );
+
+      const result = await builder.build({
+        threadId,
+        agentId: 'agent1',
+        systemPrompt: 'Follow the house rules. '.repeat(120),
+        currentInput: 'What is the door code?',
+      });
+
+      expect(JSON.stringify(result.messages)).toContain('The door code is 4417');
+    });
+  });
+
+  describe('hybrid recall with a reranker', () => {
+    it('lets the reranker order what the search found, and keeps the order when it fails', async () => {
+      const say = async (content: string) =>
+        adapter.addEntry({ threadId, message: { role: 'user', content }, tokenCount: 1 });
+      await say('My cat Tom likes tuna');
+      await say('My cat Tom sleeps a lot');
+      for (let n = 0; n < 60; n++) await say(`Planning the garden bed number ${n} together`);
+      const order = (context: { recalled?: { entries: { message: { content: unknown } }[] } }) =>
+        (context.recalled?.entries ?? []).map((entry) => String(entry.message.content));
+      const build = (reranker?: Reranker) =>
+        new ContextBuilder(
+          { maxTokens: 900, strategy: 'hybrid' },
+          { memoryAdapter: adapter, ...(reranker && { reranker }) }
+        ).build({ threadId, agentId: 'agent1', currentInput: 'Tell me about my cat Tom' });
+
+      const plain = order(await build());
+      const reversed = order(
+        await build({ rerank: async (_query, results) => [...results].reverse() })
+      );
+      const failing = await build({
+        rerank: async () => {
+          throw new Error('reranker down');
+        },
+      });
+
+      expect(plain.slice(0, 2).sort()).toEqual([
+        'My cat Tom likes tuna',
+        'My cat Tom sleeps a lot',
+      ]);
+      expect(reversed).not.toEqual(plain);
+      expect(order(failing)).toEqual(plain);
+      expect(failing.errors?.some((error) => error.error.message === 'reranker down')).toBe(true);
     });
   });
 

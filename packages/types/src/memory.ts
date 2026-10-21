@@ -5,7 +5,8 @@
 import type { Message, ToolCall, ToolResult } from './message';
 import type { GraphContext, GraphContextOptions, GraphNode } from './knowledge-graph';
 import type { MemoryCompactionConfig } from './session';
-import type { MemoryExtractionConfig } from './memory-items';
+import type { MemoryExtractionConfig, MemoryItem } from './memory-items';
+import type { Reranker } from './rag';
 
 export type MemoryType = 'conversation' | 'fact' | 'embedding';
 
@@ -537,10 +538,16 @@ export interface ContextBuilderConfig {
   graphContextOptions?: GraphContextOptions;
   /**
    * Budgets of the partitions, merged over the defaults: `system`, `pinned`, `index`,
-   * `summaries`, `brief` and `final` required, `facts` 15%, `recall` 35%, `recent` the rest.
+   * `summaries`, `brief` and `final` required, `facts` 15%, `recall` 35% (60% for `hybrid`, as
+   * far as the other shares leave room), `recent` the rest.
    * The shares of the partitions that are not required add up to 1 at most.
    */
   partitions?: Partial<Record<ContextPartition, ContextPartitionBudget>>;
+  /**
+   * IANA time zone the dates of recalled turns are shown in and the time a turn names is read
+   * on, when the thread names none (`metadata.timeZone`): UTC by default
+   */
+  timeZone?: string;
 }
 
 /**
@@ -592,6 +599,11 @@ export interface BuiltContext {
   partitions: Partial<Record<ContextPartition, number>>;
   facts: Fact[];
   semanticResults: (Embedding & { score: number })[];
+  /**
+   * What a search of memory brought for the turn (the `hybrid` strategy): earlier turns of the
+   * thread, with the turns next to them, and memory items, best first
+   */
+  recalled?: { entries: MemoryEntry[]; items: MemoryItem[] };
   graphContext?: GraphContext;
   tokenCount: number;
   /** Whether history entries were left out, see `dropped.entries` */
@@ -630,6 +642,11 @@ export interface MemoryConfig {
   compaction?: MemoryCompactionConfig;
   /** Memory items extracted from a run's conversation after the run, off unless set */
   extraction?: MemoryExtractionConfig;
+  /**
+   * Reorders the best of what a search of memory found for a turn (the `hybrid` strategy), such
+   * as a cross-encoder or a reranking model, after its own lexical rerank
+   */
+  reranker?: Reranker;
 }
 
 export type SearchStrategy = 'vector' | 'keyword' | 'hybrid';

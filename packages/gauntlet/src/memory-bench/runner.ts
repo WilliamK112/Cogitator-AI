@@ -6,7 +6,6 @@ import {
   type RunMiddleware,
 } from '@cogitator-ai/core';
 import {
-  ContextBuilder,
   MemoryExtractor,
   MemoryItems,
   countMessagesTokens,
@@ -372,6 +371,9 @@ export function benchRuntime(
         strategy: contextStrategy(options.strategy.name),
         maxTokens: options.strategy.contextTokens,
         ...(extracted && { includeFacts: true }),
+        ...(options.strategy.recallShare !== undefined && {
+          partitions: { recall: { share: options.strategy.recallShare } },
+        }),
       },
       ...(compacted && {
         compaction: {
@@ -450,29 +452,21 @@ export async function ingest(
  * Embeds the history the strategy will score and every question before the questions run, so
  * each strategy's context build is measured on a warm cache, the provider's embedding latency
  * left out alike for all of them (a strategy that runs later must not find the questions cached
- * by an earlier one). A context builder of the same strategy and budget builds the thread's
- * context once: it embeds exactly the entries the runtime's builder will score (its order,
- * filters and limits), and the vectors land in the shared embedding cache.
+ * by an earlier one). The runtime indexes the whole thread (`indexMemory`), so its first search
+ * already sees every entry, and the vectors land in the shared embedding cache.
  */
 async function warm(
   cog: Cogitator,
-  agent: Agent,
   threadId: string,
   conversation: BenchConversation,
   options: AnswerOptions
 ): Promise<void> {
-  const memoryAdapter = await cog.getMemory();
-  if (!memoryAdapter) throw new Error('The bench runtime has no memory');
-  const builder = new ContextBuilder(
-    { strategy: contextStrategy(options.strategy.name), maxTokens: options.strategy.contextTokens },
-    { memoryAdapter, ...(options.embedding && { embeddingService: options.embedding }) }
-  );
-  const context = await builder.build({
-    threadId,
-    agentId: agent.id,
-    currentInput: conversation.questions[0]?.question ?? 'warm-up',
-  });
-  const errors = (context.errors ?? []).map(({ error }) => error);
+  const errors: Error[] = [];
+  try {
+    await cog.indexMemory(threadId);
+  } catch (error) {
+    errors.push(error instanceof Error ? error : new Error(String(error)));
+  }
   if (options.embedding) {
     try {
       const inputs = conversation.questions.map((question) => question.question);
@@ -581,6 +575,15 @@ async function closeSession(
   return { leafId: thread.data?.activeLeafId ?? null, compacted: watch.result !== undefined };
 }
 
+/** When the last turn of `conversation` was said, when its dataset dates its turns */
+function lastSaid(conversation: BenchConversation): Date | undefined {
+  let last: Date | undefined;
+  for (const turn of conversation.turns) {
+    if (turn.at && (!last || turn.at > last)) last = turn.at;
+  }
+  return last;
+}
+
 /** The figures of an answer that was never given. */
 const unanswered = {
   output: '',
@@ -662,9 +665,11 @@ export async function answerConversation(
       ...(turn > 1 && { turn }),
     };
     try {
+      const asOf = question.askedAt ?? lastSaid(conversation);
       const result = await cog.run(benchAgent(answerInstructions(conversation, question)), {
         input,
         threadId,
+        ...(asOf && { asOf }),
         ...(request.after === undefined
           ? { saveHistory: false }
           : { saveHistory: true, branch: { fromEntryId: request.after, activate: false } }),
@@ -717,7 +722,7 @@ export async function answerConversation(
 
   try {
     const thread = await ingest(cog, agent, conversation);
-    if (options.embedding) await warm(cog, agent, thread.threadId, conversation, options);
+    if (options.embedding) await warm(cog, thread.threadId, conversation, options);
     let from = thread.leafId;
     if (watch && strategy === 'extracted') {
       const extracted = await extractConversation(cog, thread.threadId, watch);

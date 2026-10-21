@@ -1,10 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { ChatStreamChunk, EmbeddingService, LLMBackend } from '@cogitator-ai/types';
-import type { ContextBuilderDeps } from '@cogitator-ai/memory';
+import type { BuildContextOptions, ContextBuilderDeps } from '@cogitator-ai/memory';
+import type { ContextBuilderConfig } from '@cogitator-ai/types';
 import { Cogitator } from '../cogitator';
 import { Agent } from '../agent';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { InMemoryEmbeddingAdapter } from '@cogitator-ai/memory';
 
 const captured = vi.hoisted(() => [] as ContextBuilderDeps[]);
+const configs = vi.hoisted(() => [] as ContextBuilderConfig[]);
+const builds = vi.hoisted(() => [] as BuildContextOptions[]);
 
 vi.mock('@cogitator-ai/memory', async (importOriginal) => {
   const original = await importOriginal<typeof import('@cogitator-ai/memory')>();
@@ -12,6 +19,11 @@ vi.mock('@cogitator-ai/memory', async (importOriginal) => {
     constructor(...args: ConstructorParameters<typeof original.ContextBuilder>) {
       super(...args);
       captured.push(args[1]);
+      configs.push(args[0]);
+    }
+    async build(options: BuildContextOptions) {
+      builds.push(options);
+      return super.build(options);
     }
   }
   /** Qdrant kept in process, so runs can use a vector store outside the thread store */
@@ -60,6 +72,27 @@ describe('memory wiring', () => {
     await cog.close();
   });
 
+  it('reads dates in the time zone of the thread, else of memory extraction', async () => {
+    const cog = new Cogitator({
+      llm: { backends: { mock: backend } },
+      memory: {
+        adapter: 'memory',
+        contextBuilder: { maxTokens: 4000, strategy: 'hybrid' },
+        extraction: { timeZone: 'America/New_York' },
+      },
+    });
+    const agent = new Agent({ name: 'a', model: 'mock/m', instructions: 'x' });
+
+    await cog.run(agent, { input: 'hi', threadId: 'plain' });
+    expect(configs.at(-1)?.timeZone).toBe('America/New_York');
+    expect(builds.at(-1)?.timeZone).toBeUndefined();
+
+    await cog.memory?.createThread('a', { timeZone: 'Asia/Tokyo' }, 'zoned');
+    await cog.run(agent, { input: 'hi', threadId: 'zoned', threadAccess: 'shared' });
+    expect(builds.at(-1)?.timeZone).toBe('Asia/Tokyo');
+    await cog.close();
+  });
+
   describe('message index', () => {
     function fakeEmbedding(): EmbeddingService & { embedBatch: ReturnType<typeof vi.fn> } {
       return {
@@ -97,7 +130,7 @@ describe('memory wiring', () => {
       expect(embedding.embed).toHaveBeenCalledWith('second question');
     });
 
-    it('keeps no index for the in-process memory adapter, whose vectors stay in process', async () => {
+    it('indexes the in-process memory adapter in process, not in the configured store', async () => {
       const cog = new Cogitator({
         llm: { backends: { mock: backend } },
         memory: {
@@ -110,8 +143,47 @@ describe('memory wiring', () => {
 
       await cog.run(agent, { input: 'hi' });
 
-      expect(captured.at(-1)?.messageIndex).toBeUndefined();
+      expect(captured.at(-1)?.messageIndex).toBeDefined();
       await cog.close();
+    });
+
+    it('indexes a long thread written before the index a page at a time', async () => {
+      const path = join(mkdtempSync(join(tmpdir(), 'cogitator-index-')), 'memory.db');
+      const writer = new Cogitator({
+        llm: { backends: { mock: backend } },
+        memory: { adapter: 'sqlite', sqlite: { path }, contextBuilder: { strategy: 'recent' } },
+      });
+      const memory = await writer.getMemory();
+      await memory?.createThread('a', {}, 'long');
+      for (let n = 0; n < 1200; n++) {
+        await memory?.addEntry({
+          threadId: 'long',
+          message: { role: n % 2 ? 'assistant' : 'user', content: `turn ${n}` },
+          tokenCount: 2,
+        });
+      }
+      await writer.close();
+
+      const embedding = fakeEmbedding();
+      const lookups = vi.spyOn(InMemoryEmbeddingAdapter.prototype, 'getBySources');
+      const reader = new Cogitator({
+        llm: { backends: { mock: backend } },
+        memory: {
+          adapter: 'sqlite',
+          sqlite: { path },
+          contextBuilder: { maxTokens: 4000, strategy: 'hybrid' },
+          embedding,
+        },
+      });
+      await reader.indexMemory('long');
+
+      const embedded = embedding.embedBatch.mock.calls.flatMap(([texts]) => texts as string[]);
+      expect(embedded).toHaveLength(1200);
+      expect(new Set(embedded).size).toBe(1200);
+      expect(lookups).toHaveBeenCalled();
+      expect(Math.max(...lookups.mock.calls.map(([ids]) => ids.length))).toBeLessThanOrEqual(500);
+      lookups.mockRestore();
+      await reader.close();
     });
 
     it('keeps no index for the recent strategy', async () => {

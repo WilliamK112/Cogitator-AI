@@ -12,24 +12,31 @@ import type {
   Embedding,
   GraphContext,
   ContextBuilderConfig,
+  ContextPartitionBudget,
   ContextBuildError,
   BuiltContext,
   DroppedContext,
   GraphNode,
   MemoryAdapter,
   FactAdapter,
+  Reranker,
   MemoryItem,
   MemoryItemKind,
   MemoryItemTrust,
   EmbeddingAdapter,
   EmbeddingService,
   MemoryResult,
+  TimePrecision,
 } from '@cogitator-ai/types';
-import { visibleIn, type MemoryItems } from './memory-items';
+import { isMemoryItemAdapter, onePerSlot, visibleIn, type MemoryItems } from './memory-items';
+import { MemoryRetriever, type Retrieval } from './retrieval/retriever';
+import { analyzeQuery } from './retrieval/query';
 import type { GraphContextBuilder } from './knowledge-graph/graph-context-builder';
 import { readCompactedHistory } from './compaction';
+import { calendarDate, isTimeZone } from './time-resolution';
 import {
   ContextAssembler,
+  DEFAULT_PARTITIONS,
   fitInOrder,
   type Assembly,
   type AssemblyBlock,
@@ -113,6 +120,88 @@ const SOURCE_OF_TRUST: Record<MemoryItemTrust, Fact['source']> = {
   web: 'inferred',
 };
 
+/** The heading of the earlier turns a search of memory brought */
+const RECALLED_TURNS_HEADER = 'Earlier in this conversation:';
+/** Memory items embedded in one call */
+const ITEM_EMBED_BATCH = 64;
+/** Vectors of memory items a builder keeps, the used least lately dropped past it */
+const ITEM_VECTORS_KEPT = 20_000;
+/** Hits of a search of memory a reranker reorders, the best */
+const RERANKED = 30;
+/** The heading of the memory items a search of memory brought */
+const RECALLED_ITEMS_HEADER = 'From memory:';
+
+/** `YYYY-MM-DD` of `date` on the calendar of `timeZone` */
+function dayOf(date: Date, timeZone: string): string {
+  const { year, month, day } = calendarDate(date, timeZone);
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/** Earlier turns as the context shows them: each on its line with its date and who said it */
+function turnLines(turn: readonly MemoryEntry[], timeZone: string): string {
+  return turn
+    .map((entry) => {
+      const text = typeof entry.message.content === 'string' ? entry.message.content : '';
+      return `[${dayOf(entry.createdAt, timeZone)}] ${entry.message.role}: ${text}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Tokens recalled turns take: each line as shown, or the entry's own count when that is more,
+ * such as a stored count of a model that reads the text as more tokens than an estimate
+ */
+function recalledTokens(turn: readonly MemoryEntry[], timeZone: string): number {
+  return turn.reduce(
+    (sum, entry) =>
+      sum + Math.max(countTokens(turnLines([entry], timeZone)), countEntryTokens(entry)),
+    0
+  );
+}
+
+/** A memory item as the context shows it, with when it held when it no longer does */
+function itemLine(item: MemoryItem, timeZone: string): string {
+  const day = (date: Date) => dayOf(date, timeZone);
+  const held =
+    item.validTo !== undefined
+      ? ` (${item.validFrom ? `${day(item.validFrom)} to ` : 'until '}${day(item.validTo)})`
+      : item.about?.start
+        ? ` (${whenOf(item.about.start, item.about.end, item.about.precision, timeZone)})`
+        : '';
+  return `- ${item.content}${held}`;
+}
+
+/**
+ * The time an item is about as a date to the precision it was said with, never the words that
+ * said it: `last Friday` read a month later would point at another day. The date is read in the
+ * middle of the interval, so a month or a year resolved in another time zone than the one shown
+ * is not shown as the one before.
+ */
+function whenOf(
+  start: Date,
+  end: Date | undefined,
+  precision: TimePrecision,
+  timeZone: string
+): string {
+  const middle =
+    end !== undefined && end.getTime() > start.getTime() && precision !== 'instant'
+      ? new Date((start.getTime() + end.getTime()) / 2)
+      : start;
+  const day = dayOf(middle, timeZone);
+  switch (precision) {
+    case 'year':
+      return day.slice(0, 4);
+    case 'month':
+      return day.slice(0, 7);
+    case 'week':
+      return `week of ${dayOf(start, timeZone)}`;
+    case 'approximate':
+      return `around ${day}`;
+    default:
+      return day;
+  }
+}
+
 /** A line of the `Known facts` block, with the value a fact replaced when it replaced one */
 function factLine(fact: Fact): string {
   const previously = fact.metadata?.previously;
@@ -121,45 +210,11 @@ function factLine(fact: Fact): string {
     : `- ${fact.content}`;
 }
 
-/** How narrow a scope is: a thread's items over a user's, a user's over the agent's */
-function narrowness(item: MemoryItem): number {
-  return (
-    (item.scope.threadId !== undefined ? 4 : 0) +
-    (item.scope.projectId !== undefined ? 2 : 0) +
-    (item.scope.userId !== undefined ? 1 : 0)
-  );
-}
-
-/** Whether state `a` of a slot wins over `b`: it started later, or together in a narrower scope */
-function laterState(a: MemoryItem, b: MemoryItem): boolean {
-  const since = (a.validFrom?.getTime() ?? 0) - (b.validFrom?.getTime() ?? 0);
-  return since !== 0 ? since > 0 : narrowness(a) > narrowness(b);
-}
-
-/**
- * `items` with one item per slot: the one that started to hold last, of the narrowest scope when
- * two started together, since a run sees a slot's states of its thread, its user and the agent
- * at once
- */
-function onePerSlot(items: readonly MemoryItem[]): MemoryItem[] {
-  const bySlot = new Map<string, MemoryItem>();
-  const kept: MemoryItem[] = [];
-  for (const item of items) {
-    if (item.slot === undefined) {
-      kept.push(item);
-      continue;
-    }
-    const known = bySlot.get(item.slot);
-    if (!known || laterState(item, known)) bySlot.set(item.slot, item);
-  }
-  return [...kept, ...bySlot.values()];
-}
-
 /**
  * The memory items of the run's agent, user and thread that hold now, as facts, under the
  * agent's memory id and under its runtime id (where facts added for `agent.id` are): one per slot,
  * instructions and preferences first, newest first within a kind, each with the value of the
- * item it superseded when the run may still see it
+ * item it superseded when the run may still see it, as of `options.asOf`
  */
 async function loadItemFacts(items: MemoryItems, options: BuildContextOptions): Promise<Fact[]> {
   const agentIds = [...new Set([options.memoryAgentId ?? options.agentId, options.agentId])];
@@ -171,6 +226,7 @@ async function loadItemFacts(items: MemoryItems, options: BuildContextOptions): 
           ...(options.userId !== undefined && { userId: options.userId }),
           threadId: options.threadId,
         },
+        ...(options.asOf !== undefined && { asOf: options.asOf }),
       })
     )
   );
@@ -184,6 +240,7 @@ async function loadItemFacts(items: MemoryItems, options: BuildContextOptions): 
     (a, b) =>
       KIND_ORDER[a.kind] - KIND_ORDER[b.kind] || b.recordedAt.getTime() - a.recordedAt.getTime()
   );
+  const knownAt = (options.asOf ?? new Date()).getTime();
   return Promise.all(
     ordered.map(async (item): Promise<Fact> => {
       const replaced = item.supersedes?.at(-1);
@@ -192,7 +249,7 @@ async function loadItemFacts(items: MemoryItems, options: BuildContextOptions): 
         before &&
         agentIds.includes(before.scope.agentId) &&
         visibleIn(before, { ...scope, agentId: before.scope.agentId }) &&
-        (before.expiredAt === undefined || before.expiredAt.getTime() > Date.now());
+        (before.expiredAt === undefined || before.expiredAt.getTime() > knownAt);
       const previously = shown ? (before.value ?? before.content) : undefined;
       return {
         id: item.id,
@@ -222,6 +279,8 @@ type Piece =
   | { kind: 'input' }
   | { kind: 'entry'; entry: MemoryEntry }
   | { kind: 'fact'; fact: Fact }
+  | { kind: 'retrieved'; entries: MemoryEntry[] }
+  | { kind: 'recalled'; item: MemoryItem }
   | { kind: 'semantic'; result: Embedding & { score: number } }
   | { kind: 'graph'; context: GraphContext };
 
@@ -305,6 +364,8 @@ export interface ContextBuilderDeps {
    * user and thread see that hold now
    */
   memoryItems?: MemoryItems;
+  /** Reorders the best of what a search of memory found for a turn, see `MemoryConfig.reranker` */
+  reranker?: Reranker;
   embeddingAdapter?: EmbeddingAdapter;
   embeddingService?: EmbeddingService;
   graphContextBuilder?: GraphContextBuilder;
@@ -347,6 +408,16 @@ export interface BuildContextOptions {
   index?: string;
   /** Notes prepared for this turn (the `brief` partition) */
   brief?: string;
+  /**
+   * The moment the turn is read at, the clock by default: the date memory searches resolve the
+   * time a turn names from, and the moment memory items are read as of
+   */
+  asOf?: Date;
+  /**
+   * IANA time zone of the thread, in place of the builder's `timeZone`: the calendar the dates of
+   * recalled turns are shown in and the time a turn names is read on
+   */
+  timeZone?: string;
 }
 
 type ResolvedConfig = Required<Omit<ContextBuilderConfig, 'maxTokens' | 'reserveTokens'>> &
@@ -356,6 +427,32 @@ type ResolvedConfig = Required<Omit<ContextBuilderConfig, 'maxTokens' | 'reserve
 interface ScoringScope {
   mark?: number;
   threadSize: number;
+}
+
+/**
+ * Share of the budget `hybrid` recalls into when its config sets none: older turns and memory
+ * items found for the turn earn more of a long thread's budget than its newest turns do, and
+ * what recall leaves unused goes back to `recent`
+ */
+const HYBRID_RECALL_SHARE = 0.6;
+
+/**
+ * The partitions of `config`, with the `recall` share of `hybrid` raised to
+ * {@link HYBRID_RECALL_SHARE} when the config sets none, as far as the other shares leave room
+ */
+function partitionsFor(
+  config: ContextBuilderConfig
+): Partial<Record<ContextPartition, ContextPartitionBudget>> {
+  const partitions = config.partitions ?? {};
+  if (config.strategy !== 'hybrid' || partitions.recall?.share !== undefined) return partitions;
+  const others = (Object.keys(DEFAULT_PARTITIONS) as ContextPartition[])
+    .filter((name) => name !== 'recall')
+    .reduce((sum, name) => {
+      const budget = { ...DEFAULT_PARTITIONS[name], ...partitions[name] };
+      return sum + (budget.required ? 0 : (budget.share ?? 0));
+    }, 0);
+  const share = Math.max(0, Math.min(HYBRID_RECALL_SHARE, 1 - others));
+  return { ...partitions, recall: { ...partitions.recall, share } };
 }
 
 function validBudget(value: number, name: string): number {
@@ -369,7 +466,10 @@ export class ContextBuilder {
   private config: ResolvedConfig;
   private deps: ContextBuilderDeps;
   private readonly entryVectors = new Map<string, Float32Array>();
+  /** Vectors of memory items by model and item id: an item's content never changes */
+  private readonly itemVectors = new Map<string, Float32Array>();
   private readonly assembler: ContextAssembler;
+  private readonly retriever = new MemoryRetriever();
 
   constructor(config: ContextBuilderConfig, deps: ContextBuilderDeps) {
     if (config.maxTokens !== undefined) validBudget(config.maxTokens, 'maxTokens');
@@ -382,9 +482,13 @@ export class ContextBuilder {
       includeSemanticContext: config.includeSemanticContext ?? false,
       includeGraphContext: config.includeGraphContext ?? false,
       graphContextOptions: config.graphContextOptions ?? {},
-      partitions: config.partitions ?? {},
+      partitions: partitionsFor(config),
+      timeZone: config.timeZone ?? 'UTC',
     };
-    this.assembler = new ContextAssembler(config.partitions);
+    if (!isTimeZone(this.config.timeZone)) {
+      throw new Error(`ContextBuilder timeZone must be an IANA time zone, got ${config.timeZone}`);
+    }
+    this.assembler = new ContextAssembler(this.config.partitions);
     this.deps = deps;
   }
 
@@ -443,6 +547,7 @@ export class ContextBuilder {
     const facts = this.config.includeFacts
       ? ((await this.attempt('facts', errors, () => this.loadFacts(options))) ?? [])
       : [];
+    const keptFacts = new Set<string>();
     if (facts.length > 0) {
       candidates.push({
         partition: 'facts',
@@ -452,6 +557,14 @@ export class ContextBuilder {
           text: fact.content,
           sourceId: fact.id,
         })),
+        fit: (blocks, budget) => {
+          const fitted = fitInOrder(blocks, budget);
+          keptFacts.clear();
+          for (const block of fitted.kept) {
+            if (block.value.kind === 'fact') keptFacts.add(block.value.fact.id);
+          }
+          return fitted;
+        },
       });
     }
 
@@ -467,10 +580,31 @@ export class ContextBuilder {
       droppedNodes: [],
       droppedTokens: 0,
     };
-    if (semantic.length > 0 || graph) {
+    const scope: ScoringScope = { mark: this.deps.messageIndex?.mark(), threadSize: 0 };
+    const entries = (await this.attempt('history', errors, () => this.readHistory(options))) ?? [];
+    scope.threadSize = entries.length;
+    const summaries = entries.filter((entry) => entry.type === 'compaction');
+    const history = entries.filter((entry) => entry.type !== 'compaction');
+    const required = () =>
+      candidates
+        .filter((candidate) =>
+          ['system', 'pinned', 'index', 'brief', 'final'].includes(candidate.partition)
+        )
+        .flatMap((candidate) => candidate.blocks)
+        .reduce((sum, block) => sum + block.tokens, 0) +
+      summaries.reduce((sum, entry) => sum + countEntryTokens(entry), 0);
+    const recalled =
+      this.config.strategy === 'hybrid' && options.currentInput
+        ? ((await this.attempt('relevance', errors, () =>
+            this.recall(history, options, availableTokens, required(), facts, errors, scope)
+          )) ?? [])
+        : [];
+
+    if (semantic.length > 0 || graph || recalled.length > 0) {
       candidates.push({
         partition: 'recall',
         blocks: [
+          ...recalled,
           ...semantic.map((result) => ({
             value: { kind: 'semantic' as const, result },
             tokens: countTokens(`- ${result.content}`),
@@ -481,16 +615,33 @@ export class ContextBuilder {
             ? [{ value: { kind: 'graph' as const, context: graph }, tokens: graph.tokenCount }]
             : []),
         ],
-        fit: (blocks, budget) => this.fitRecall(blocks, budget, options, graphOutcome, errors),
+        fit: (blocks, budget) =>
+          this.fitRecall(
+            blocks.filter(
+              (block) => block.value.kind !== 'recalled' || !keptFacts.has(block.value.item.id)
+            ),
+            budget,
+            options,
+            graphOutcome,
+            errors
+          ),
       });
     }
 
     const turnFrame = [
-      ...(options.brief?.trim() || facts.length > 0 || semantic.length > 0 || graph
+      ...(options.brief?.trim() ||
+      facts.length > 0 ||
+      semantic.length > 0 ||
+      graph ||
+      recalled.length > 0
         ? [[TURN_CONTEXT_OPEN, TURN_CONTEXT_HEADER, TURN_CONTEXT_CLOSE].join('\n\n')]
         : []),
       ...(facts.length > 0 ? ['Known facts:'] : []),
       ...(semantic.length > 0 ? ['Relevant context:'] : []),
+      ...(recalled.some((block) => block.value.kind === 'retrieved')
+        ? [RECALLED_TURNS_HEADER]
+        : []),
+      ...(recalled.some((block) => block.value.kind === 'recalled') ? [RECALLED_ITEMS_HEADER] : []),
     ].join('\n\n');
     if (turnFrame) {
       const final = candidates.findIndex((candidate) => candidate.partition === 'final');
@@ -503,11 +654,6 @@ export class ContextBuilder {
         candidates[final] = { partition: 'final', blocks: [...candidates[final]!.blocks, frame] };
     }
 
-    const scope: ScoringScope = { mark: this.deps.messageIndex?.mark(), threadSize: 0 };
-    const entries = (await this.attempt('history', errors, () => this.readHistory(options))) ?? [];
-    scope.threadSize = entries.length;
-    const summaries = entries.filter((entry) => entry.type === 'compaction');
-    const history = entries.filter((entry) => entry.type !== 'compaction');
     if (summaries.length > 0) {
       candidates.push({ partition: 'summaries', blocks: summaries.map(entryBlock) });
     }
@@ -547,6 +693,7 @@ export class ContextBuilder {
 
     const assembly = await this.assembler.assemble(availableTokens, candidates);
     return this.compose(assembly, {
+      timeZone: this.timeZoneOf(options),
       systemPrompt,
       entries,
       facts,
@@ -571,8 +718,10 @@ export class ContextBuilder {
       graphOutcome: { droppedNodes: GraphNode[]; droppedTokens: number; failed?: boolean };
       errors: ContextBuildError[];
       warnings: string[];
+      timeZone: string;
     }
   ): BuiltContext {
+    const { timeZone } = parts;
     const kept = (partition: ContextPartition) => assembly.kept[partition] ?? [];
     const textsOf = (partition: ContextPartition) =>
       kept(partition).flatMap((block) => (block.value.kind === 'text' ? [block.value.text] : []));
@@ -598,6 +747,17 @@ export class ContextBuilder {
     const graphContext = kept('recall')
       .map((block) => block.value)
       .find((value) => value.kind === 'graph')?.context;
+    const inHistory = new Set(historyEntries.map((entry) => entry.id));
+    const recalledTurns = kept('recall').flatMap((block) =>
+      block.value.kind === 'retrieved'
+        ? [block.value.entries.filter((entry) => !inHistory.has(entry.id))]
+        : []
+    );
+    const shownTurns = recalledTurns.filter((turn) => turn.length > 0);
+    const factIds = new Set(facts.map((fact) => fact.id));
+    const recalledItems = kept('recall').flatMap((block) =>
+      block.value.kind === 'recalled' && !factIds.has(block.value.item.id) ? [block.value.item] : []
+    );
     const turnBlocks = [
       ...textsOf('brief'),
       ...(facts.length > 0 ? [`Known facts:\n${facts.map(factLine).join('\n')}`] : []),
@@ -605,6 +765,16 @@ export class ContextBuilder {
         ? [`Relevant context:\n${semanticResults.map((r) => `- ${r.content}`).join('\n')}`]
         : []),
       ...(graphContext?.formattedContext ? [graphContext.formattedContext] : []),
+      ...(shownTurns.length > 0
+        ? [
+            `${RECALLED_TURNS_HEADER}\n${shownTurns.map((turn) => turnLines(turn, timeZone)).join('\n\n')}`,
+          ]
+        : []),
+      ...(recalledItems.length > 0
+        ? [
+            `${RECALLED_ITEMS_HEADER}\n${recalledItems.map((item) => itemLine(item, timeZone)).join('\n')}`,
+          ]
+        : []),
     ];
     const memoryContext = formatTurnContext(turnBlocks);
     if (memoryContext) messages.push({ role: 'user', content: memoryContext });
@@ -615,7 +785,10 @@ export class ContextBuilder {
           .filter((block) => block.partition === partition)
           .flatMap((block) => (block.sourceId === undefined ? [] : [block.sourceId]))
       );
-    const keptEntries = new Set(historyEntries.map((entry) => entry.id));
+    const keptEntries = new Set([
+      ...historyEntries.map((entry) => entry.id),
+      ...shownTurns.flat().map((entry) => entry.id),
+    ]);
     const droppedEntries = new Set(
       [...droppedIds('summaries'), ...droppedIds('recent')].filter((id) => !keptEntries.has(id))
     );
@@ -636,6 +809,9 @@ export class ContextBuilder {
       partitions: assembly.tokens,
       facts,
       semanticResults,
+      ...((shownTurns.length > 0 || recalledItems.length > 0) && {
+        recalled: { entries: shownTurns.flat(), items: recalledItems },
+      }),
       graphContext,
       tokenCount: assembly.used - (assembly.tokens.final ?? 0),
       truncated: dropped.entries.length > 0,
@@ -790,6 +966,143 @@ export class ContextBuilder {
   }
 
   /**
+   * The blocks a search of memory brings for the turn (the `hybrid` strategy): the earlier turns
+   * of `history` and the memory items {@link MemoryRetriever} finds, best first, each turn with
+   * the turns next to it. The newest turns the context will hold in `recent` anyway (what the
+   * budget leaves after the required partitions, `facts` and `recall`) are not searched. Items
+   * the `facts` partition keeps are left out when `recall` is fitted.
+   */
+  private async recall(
+    history: MemoryEntry[],
+    options: BuildContextOptions,
+    availableTokens: number,
+    requiredTokens: number,
+    facts: readonly Fact[],
+    errors: ContextBuildError[],
+    scope: ScoringScope
+  ): Promise<AssemblyBlock<Piece>[]> {
+    const input = options.currentInput;
+    if (!input) return [];
+    const anchor = options.asOf ?? new Date();
+    const timeZone = this.timeZoneOf(options);
+    if (!analyzeQuery(input, anchor, timeZone).retrieve) return [];
+    const factsDemand = facts.reduce((sum, fact) => sum + countTokens(factLine(fact)), 0);
+    const tail = this.assembler.roomOf('recent', availableTokens - requiredTokens, {
+      facts: factsDemand,
+    });
+    const held = new Set(this.selectRecentEntries(history, tail).map((entry) => entry.id));
+    const embedding = this.deps.embeddingService;
+    const inputVector = embedding?.embed(input);
+    inputVector?.catch(() => undefined);
+    const scored = embedding
+      ? await this.scoreEntries(
+          history.filter((entry) => !held.has(entry.id)),
+          input,
+          0,
+          errors,
+          scope,
+          inputVector
+        )
+      : null;
+    const items = this.deps.memoryItems;
+    const memory = this.deps.memoryAdapter;
+    const retrieval = await this.retriever.retrieve({
+      input,
+      anchor,
+      timeZone,
+      history,
+      held,
+      ...(scored && { cosines: new Map(scored.map(({ entry, score }) => [entry.id, score])) }),
+      ...(items &&
+        isMemoryItemAdapter(memory) && {
+          items,
+          itemAdapter: memory,
+          scope: {
+            agentId: options.memoryAgentId ?? options.agentId,
+            ...(options.userId !== undefined && { userId: options.userId }),
+            threadId: options.threadId,
+          },
+          agentIds: [options.agentId],
+          ...(inputVector && {
+            itemCosines: (found: readonly MemoryItem[]) =>
+              this.itemCosines(found, inputVector, errors),
+          }),
+        }),
+    });
+    const hits = this.deps.reranker
+      ? await this.reranked(input, retrieval.hits, errors, timeZone)
+      : retrieval.hits;
+    const position = new Map(history.map((entry, at) => [entry.id, at]));
+    const covered = new Set<string>();
+    return hits.flatMap((hit): AssemblyBlock<Piece>[] => {
+      if (hit.kind === 'item') {
+        const line = itemLine(hit.hit.item, timeZone);
+        return [{ value: { kind: 'recalled', item: hit.hit.item }, tokens: countTokens(line) }];
+      }
+      const turn = [hit.hit.entry, ...hit.hit.neighbors]
+        .filter((entry) => !covered.has(entry.id))
+        .sort((a, b) => (position.get(a.id) ?? 0) - (position.get(b.id) ?? 0));
+      if (turn.length === 0) return [];
+      for (const entry of turn) covered.add(entry.id);
+      return [
+        {
+          value: { kind: 'retrieved', entries: turn },
+          tokens: recalledTokens(turn, timeZone),
+        },
+      ];
+    });
+  }
+
+  /** The thread's time zone when the build names a valid one, else the builder's */
+  private timeZoneOf(options: BuildContextOptions): string {
+    return options.timeZone !== undefined && isTimeZone(options.timeZone)
+      ? options.timeZone
+      : this.config.timeZone;
+  }
+
+  /**
+   * `hits` with the best {@link RERANKED} reordered by the reranker, the rest after them as they
+   * were. A reranker that fails leaves them as they were, recorded as a `relevance` error.
+   */
+  private async reranked(
+    input: string,
+    hits: Retrieval['hits'],
+    errors: ContextBuildError[],
+    timeZone: string
+  ): Promise<Retrieval['hits']> {
+    const reranker = this.deps.reranker;
+    if (!reranker || hits.length < 2) return hits;
+    const top = hits.slice(0, RERANKED);
+    const keyed = new Map(top.map((hit, at) => [String(at), hit]));
+    try {
+      const order = await reranker.rerank(
+        input,
+        top.map((hit, at) => ({
+          chunkId: String(at),
+          documentId: String(at),
+          content:
+            hit.kind === 'item'
+              ? itemLine(hit.hit.item, timeZone)
+              : turnLines([hit.hit.entry, ...hit.hit.neighbors], timeZone),
+          score: hit.hit.score,
+        }))
+      );
+      const ranked = order.flatMap((result) => {
+        const hit = keyed.get(result.chunkId);
+        keyed.delete(result.chunkId);
+        return hit ? [hit] : [];
+      });
+      return [...ranked, ...keyed.values(), ...hits.slice(RERANKED)];
+    } catch (err) {
+      errors.push({
+        source: 'relevance',
+        error: err instanceof Error ? err : new Error(String(err)),
+      });
+      return hits;
+    }
+  }
+
+  /**
    * The history a context draws on: the active branch (or the one `leafId` names) of an adapter
    * with branches, else every entry of the thread
    */
@@ -827,7 +1140,7 @@ export class ContextBuilder {
       case 'relevant':
         return this.selectRelevantEntries(entries, availableTokens, currentInput, errors, scope);
       case 'hybrid':
-        return this.selectHybridEntries(entries, availableTokens, currentInput, errors, scope);
+        return this.selectRecentEntries(entries, availableTokens);
       case 'recent':
       default:
         return this.selectRecentEntries(entries, availableTokens);
@@ -908,7 +1221,8 @@ export class ContextBuilder {
     input: string,
     minScore: number,
     errors: ContextBuildError[],
-    scope: ScoringScope
+    scope: ScoringScope,
+    inputVector?: Promise<number[]>
   ): Promise<{ entry: MemoryEntry; score: number }[] | null> {
     const embeddingService = this.deps.embeddingService;
     if (!embeddingService) return null;
@@ -948,17 +1262,17 @@ export class ContextBuilder {
           return { vectors: await this.processVectors(texts), indexed: false };
         }
       };
-      const [inputVector, { vectors, indexed }] = await Promise.all([
-        embeddingService.embed(input),
+      const [queryVector, { vectors, indexed }] = await Promise.all([
+        inputVector ?? embeddingService.embed(input),
         windowVectors(),
       ]);
-      index?.offer(input, inputVector);
+      index?.offer(input, queryVector);
 
       const scored: { entry: MemoryEntry; score: number }[] = [];
       for (const { entry } of candidates) {
         const vector = vectors.get(entry.id);
         if (!vector) continue;
-        const score = this.cosineSimilarity(inputVector, vector);
+        const score = this.cosineSimilarity(queryVector, vector);
         if (score > minScore) scored.push({ entry, score });
       }
 
@@ -966,7 +1280,7 @@ export class ContextBuilder {
         try {
           const found = await index.search(
             threadId,
-            inputVector,
+            queryVector,
             INDEX_SEARCH_RESULTS + Math.max(0, scope.threadSize - older.length),
             minScore
           );
@@ -992,6 +1306,53 @@ export class ContextBuilder {
   }
 
   /** Vectors of `texts` by entry id from the builder's own cache, embedding the ones it lacks */
+  /**
+   * How close each of `items` is to the input, by the cosine of their embeddings, each item
+   * embedded once and kept. A failure is recorded as a `relevance` error and finds nothing.
+   */
+  private async itemCosines(
+    items: readonly MemoryItem[],
+    inputVector: Promise<number[]>,
+    errors: ContextBuildError[]
+  ): Promise<Map<string, number>> {
+    const embedding = this.deps.embeddingService;
+    if (!embedding) return new Map();
+    try {
+      const keyOf = (item: MemoryItem) => `${embedding.model}:${item.id}`;
+      const missing = items.filter((item) => !this.itemVectors.has(keyOf(item)));
+      for (let start = 0; start < missing.length; start += ITEM_EMBED_BATCH) {
+        const batch = missing.slice(start, start + ITEM_EMBED_BATCH);
+        const made = await embedding.embedBatch(batch.map((item) => item.content));
+        batch.forEach((item, at) => {
+          const vector = made[at];
+          if (vector) this.itemVectors.set(keyOf(item), Float32Array.from(vector));
+        });
+      }
+      const query = await inputVector;
+      const cosines = new Map<string, number>();
+      for (const item of items) {
+        const key = keyOf(item);
+        const vector = this.itemVectors.get(key);
+        if (!vector) continue;
+        this.itemVectors.delete(key);
+        this.itemVectors.set(key, vector);
+        cosines.set(item.id, this.cosineSimilarity(query, vector));
+      }
+      while (this.itemVectors.size > ITEM_VECTORS_KEPT) {
+        const oldest = this.itemVectors.keys().next().value;
+        if (oldest === undefined) break;
+        this.itemVectors.delete(oldest);
+      }
+      return cosines;
+    } catch (err) {
+      errors.push({
+        source: 'relevance',
+        error: err instanceof Error ? err : new Error(String(err)),
+      });
+      return new Map();
+    }
+  }
+
   private async processVectors(texts: IndexedText[]): Promise<Map<string, Float32Array>> {
     const embeddingService = this.deps.embeddingService;
     const missing = texts.filter(({ entryId }) => !this.entryVectors.has(entryId));
@@ -1028,49 +1389,6 @@ export class ContextBuilder {
       this.entryVectors.set(entryId, vector);
     }
     return vector;
-  }
-
-  private async selectHybridEntries(
-    entries: MemoryEntry[],
-    availableTokens: number,
-    currentInput: string | undefined,
-    errors: ContextBuildError[],
-    scope: ScoringScope
-  ): Promise<MemoryEntry[]> {
-    if (!currentInput || !this.deps.embeddingService || entries.length <= 10) {
-      return this.selectRecentEntries(entries, availableTokens);
-    }
-
-    const semanticBudget = Math.floor(availableTokens * 0.3);
-    const usedIds = new Set<string>();
-    let usedTokens = 0;
-
-    const olderEntries = entries
-      .slice(0, -10)
-      .filter((e) => typeof e.message.content !== 'string' || e.message.content.length > 20);
-    const scoredEntries =
-      (await this.scoreEntries(olderEntries, currentInput, 0.6, errors, scope)) ?? [];
-
-    for (const { entry } of scoredEntries) {
-      const tokens = countEntryTokens(entry);
-      if (usedTokens + tokens <= semanticBudget) {
-        usedIds.add(entry.id);
-        usedTokens += tokens;
-      }
-    }
-
-    const recentEntries = new Map(
-      this.selectRecentEntries(
-        entries.filter((e) => !usedIds.has(e.id)),
-        availableTokens - usedTokens
-      ).map((entry) => [entry.id, entry])
-    );
-
-    return entries.flatMap((entry) => {
-      const recent = recentEntries.get(entry.id);
-      if (recent) return [recent];
-      return usedIds.has(entry.id) ? [entry] : [];
-    });
   }
 
   private cosineSimilarity(a: ArrayLike<number>, b: ArrayLike<number>): number {

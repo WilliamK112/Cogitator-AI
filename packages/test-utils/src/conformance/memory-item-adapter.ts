@@ -31,6 +31,7 @@ export type MemoryItemAdapterScenario =
   | 'find-order'
   | 'find-expired'
   | 'delete-items'
+  | 'count-retrieved'
   | 'returns-copies'
   | 'entity-round-trip'
   | 'entity-names'
@@ -135,13 +136,21 @@ const SCENARIOS: Record<MemoryItemAdapterScenario, (adapter: MemoryItemAdapter) 
         expiredAt: at(8),
         supersedes: ['old-1', 'old-2'],
         supersededBy: 'new-1',
+        timesRetrieved: 3,
+        lastRetrievedAt: at(9),
         metadata: { source: 'conformance', nested: { n: 1 } },
       });
       ok(await adapter.putItem(full), 'putItem');
 
       const read = ok(await adapter.getItem(full.id), 'getItem');
       assert.deepEqual(read, full);
-      for (const date of [read?.saidAt, read?.about?.start, read?.validTo, read?.expiredAt]) {
+      for (const date of [
+        read?.saidAt,
+        read?.about?.start,
+        read?.validTo,
+        read?.expiredAt,
+        read?.lastRetrievedAt,
+      ]) {
         assert.ok(date instanceof Date, 'dates come back as dates');
       }
     },
@@ -334,6 +343,29 @@ const SCENARIOS: Record<MemoryItemAdapterScenario, (adapter: MemoryItemAdapter) 
       assert.equal(ok(await adapter.getItem(a.id), 'getItem'), null);
       assert.deepEqual(ids(ok(await adapter.findItems({ agentId }), 'findItems')), [b.id]);
       ok(await adapter.deleteItems([]), 'deleteItems of nothing');
+    },
+
+    async 'count-retrieved'(adapter) {
+      if (!adapter.countRetrieved) return;
+      const { agentId, id } = scope();
+      const counted = item(agentId, id('counted'), {
+        evidence: [{ entryId: 'e1', quote: 'q' }],
+        expiredAt: at(5),
+      });
+      const gone = item(agentId, id('gone'));
+      for (const written of [counted, gone]) ok(await adapter.putItem(written), 'putItem');
+      ok(await adapter.deleteItems([gone.id]), 'deleteItems');
+
+      ok(await adapter.countRetrieved([counted.id, gone.id, counted.id], at(10)), 'countRetrieved');
+      ok(await adapter.countRetrieved([counted.id], at(20)), 'countRetrieved');
+
+      assert.equal(ok(await adapter.getItem(gone.id), 'getItem'), null);
+      assert.deepEqual(ok(await adapter.getItem(counted.id), 'getItem'), {
+        ...counted,
+        timesRetrieved: 2,
+        lastRetrievedAt: at(20),
+      });
+      ok(await adapter.countRetrieved([], at(30)), 'countRetrieved of nothing');
     },
 
     async 'returns-copies'(adapter) {
