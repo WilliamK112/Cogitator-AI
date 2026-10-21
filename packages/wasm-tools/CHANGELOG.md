@@ -1,5 +1,16 @@
 # @cogitator-ai/wasm-tools
 
+## 0.10.0
+
+### Minor Changes
+
+- [#221](https://github.com/cogitator-ai/Cogitator-AI/pull/221) [`00f3555`](https://github.com/cogitator-ai/Cogitator-AI/commit/00f3555acbe4df0150d3d627567f585e6b3fa2c9) Thanks [@bhushan4work](https://github.com/bhushan4work)! - Add color tool plugin supporting color format conversion (HEX, RGB, HSL) and WCAG 2.x contrast calculations with AA/AAA pass results for normal and large text.
+
+### Patch Changes
+
+- Updated dependencies [[`99ceb01`](https://github.com/cogitator-ai/Cogitator-AI/commit/99ceb0107f7403fba0a95e31fd2d10b743144a03)]:
+  - @cogitator-ai/types@0.53.0
+
 ## 0.9.2
 
 ### Patch Changes
