@@ -1,5 +1,11 @@
 # @cogitator-ai/wasm-tools
 
+## 0.9.0
+
+### Minor Changes
+
+- [#222](https://github.com/cogitator-ai/Cogitator-AI/pull/222) [`d2ced0e`](https://github.com/cogitator-ai/Cogitator-AI/commit/d2ced0edf3686e0cb9aacf61be5e8809af0329c6) Thanks [@bhushan4work](https://github.com/bhushan4work)! - Add `textcase` WASM tool (`createTextcaseTool`, `textcaseToolSchema`) for converting text between camel, pascal, snake, kebab, constant, title, and sentence cases with acronym, separator, and digit-boundary token splitting.
+
 ## 0.8.4
 
 ### Patch Changes
