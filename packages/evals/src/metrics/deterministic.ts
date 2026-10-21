@@ -122,6 +122,61 @@ export function contains(opts?: MatchOptions): MetricFn {
   }) as MetricFn);
 }
 
+/** Scores the fraction of keywords found in the output. */
+export function containsAll(keywords: string[], opts?: MatchOptions): MetricFn {
+  if (keywords.length === 0) {
+    throw new Error('containsAll requires at least one keyword');
+  }
+
+  const caseSensitive = opts?.caseSensitive ?? false;
+  const name = opts?.name ?? 'containsAll';
+  const targets = keywords.map((keyword) => ({
+    original: keyword,
+    search: caseSensitive ? keyword : keyword.toLowerCase(),
+  }));
+
+  return createMetricFn(name, (async (result) => {
+    const output = caseSensitive ? result.output : result.output.toLowerCase();
+    const missing = targets.filter((keyword) => !output.includes(keyword.search));
+
+    return {
+      name,
+      score: (targets.length - missing.length) / targets.length,
+      details:
+        missing.length > 0
+          ? `missing keywords: ${missing.map((keyword) => JSON.stringify(keyword.original)).join(', ')}`
+          : undefined,
+    };
+  }) as MetricFn);
+}
+
+/** Scores 1 when the output contains at least one keyword, and 0 otherwise. */
+export function containsAny(keywords: string[], opts?: MatchOptions): MetricFn {
+  if (keywords.length === 0) {
+    throw new Error('containsAny requires at least one keyword');
+  }
+
+  const caseSensitive = opts?.caseSensitive ?? false;
+  const name = opts?.name ?? 'containsAny';
+  const targets = keywords.map((keyword) => ({
+    original: keyword,
+    search: caseSensitive ? keyword : keyword.toLowerCase(),
+  }));
+
+  return createMetricFn(name, (async (result) => {
+    const output = caseSensitive ? result.output : result.output.toLowerCase();
+    const found = targets.some((keyword) => output.includes(keyword.search));
+
+    return {
+      name,
+      score: found ? 1 : 0,
+      details: found
+        ? undefined
+        : `output does not contain any of: ${targets.map((keyword) => JSON.stringify(keyword.original)).join(', ')}`,
+    };
+  }) as MetricFn);
+}
+
 /**
  * Scores 1 when the output matches `pattern`. The `g` and `y` flags are dropped: they make
  * `RegExp.test` resume from the previous match, so identical outputs would alternate between
