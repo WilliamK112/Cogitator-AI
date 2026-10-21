@@ -1,5 +1,13 @@
 # create-cogitator-app
 
+## 0.8.10
+
+### Patch Changes
+
+- Updated dependencies [[`e83c1ef`](https://github.com/cogitator-ai/Cogitator-AI/commit/e83c1efd7788d1df6b78e818599210e2b99153a7)]:
+  - @cogitator-ai/config@0.21.0
+  - @cogitator-ai/deploy@0.6.19
+
 ## 0.8.9
 
 ### Patch Changes
