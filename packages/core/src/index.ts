@@ -103,6 +103,10 @@ export {
   restrictFileTools,
   isPathAllowed,
   createCapabilitiesTool,
+  recallToolOutputTool,
+  isRecallToolOutput,
+  RECALL_TOOL_OUTPUT,
+  type RecallToolOutputParams,
   createDeviceTools,
   createSelfTools,
   loadCustomTools,
@@ -339,6 +343,10 @@ export {
   promptInjectionMiddleware,
   guardrailsMiddleware,
   compactionMiddleware,
+  clearToolOutputsMiddleware,
+  restoreClearedOutputs,
+  clearedOutputNote,
+  isClearedArguments,
   type TripwireDetails,
 } from './middleware/index';
 export type { PromptTarget, StartABTestOptions, PromptResolution } from './cogitator/prompts';
