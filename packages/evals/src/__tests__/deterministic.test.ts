@@ -137,6 +137,18 @@ describe('containsAll', () => {
     expect(() => containsAll([])).toThrow('containsAll requires at least one keyword');
   });
 
+  it('rejects empty and whitespace-only keywords', () => {
+    expect(() => containsAll([''])).toThrow('containsAll requires non-empty keywords');
+    expect(() => containsAll(['alpha', '   '])).toThrow('containsAll requires non-empty keywords');
+  });
+
+  it('ignores duplicate keywords when scoring', async () => {
+    const score = await containsAll(['alpha', 'ALPHA', 'beta'])(makeResult('alpha'));
+
+    expect(score.score).toBe(0.5);
+    expect(score.details).toBe('missing keywords: "beta"');
+  });
+
   it('supports a custom metric name', async () => {
     const metric = containsAll(['alpha'], { name: 'requiredTerms' });
 
@@ -168,6 +180,17 @@ describe('containsAny', () => {
 
   it('rejects an empty keyword list', () => {
     expect(() => containsAny([])).toThrow('containsAny requires at least one keyword');
+  });
+
+  it('rejects empty and whitespace-only keywords', () => {
+    expect(() => containsAny([''])).toThrow('containsAny requires non-empty keywords');
+    expect(() => containsAny(['alpha', '\t'])).toThrow('containsAny requires non-empty keywords');
+  });
+
+  it('ignores duplicate keywords in failure details', async () => {
+    const score = await containsAny(['alpha', 'ALPHA', 'beta'])(makeResult('gamma'));
+
+    expect(score.details).toBe('output does not contain any of: "alpha", "beta"');
   });
 
   it('supports a custom metric name', async () => {

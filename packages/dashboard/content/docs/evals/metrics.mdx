@@ -77,7 +77,7 @@ containsAny(['approved', 'accepted']);
 containsAny(['YES', 'OK'], { caseSensitive: true });
 ```
 
-Both keyword metrics are case-insensitive by default, accept a custom `name`, and reject an empty keyword list when they are created.
+Both keyword metrics use substring matching, so `cat` matches `concatenate`. They are case-insensitive by default, accept a custom `name`, ignore duplicate keywords, and reject empty lists or empty and whitespace-only keywords when they are created.
 
 | Option          | Type    | Default       | Description                |
 | --------------- | ------- | ------------- | -------------------------- |

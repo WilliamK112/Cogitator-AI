@@ -10,6 +10,38 @@ function createMetricFn(name: string, fn: MetricFn): MetricFn {
   return fn;
 }
 
+interface KeywordTarget {
+  original: string;
+  search: string;
+}
+
+function prepareKeywordTargets(
+  metricName: 'containsAll' | 'containsAny',
+  keywords: string[],
+  caseSensitive: boolean
+): KeywordTarget[] {
+  if (keywords.length === 0) {
+    throw new Error(`${metricName} requires at least one keyword`);
+  }
+
+  const targets: KeywordTarget[] = [];
+  const seen = new Set<string>();
+
+  for (const keyword of keywords) {
+    if (keyword.trim().length === 0) {
+      throw new Error(`${metricName} requires non-empty keywords`);
+    }
+
+    const search = caseSensitive ? keyword : keyword.toLowerCase();
+    if (!seen.has(search)) {
+      seen.add(search);
+      targets.push({ original: keyword, search });
+    }
+  }
+
+  return targets;
+}
+
 export function exactMatch(opts?: MatchOptions): MetricFn {
   const caseSensitive = opts?.caseSensitive ?? false;
   const name = opts?.name ?? 'exactMatch';
@@ -124,16 +156,9 @@ export function contains(opts?: MatchOptions): MetricFn {
 
 /** Scores the fraction of keywords found in the output. */
 export function containsAll(keywords: string[], opts?: MatchOptions): MetricFn {
-  if (keywords.length === 0) {
-    throw new Error('containsAll requires at least one keyword');
-  }
-
   const caseSensitive = opts?.caseSensitive ?? false;
   const name = opts?.name ?? 'containsAll';
-  const targets = keywords.map((keyword) => ({
-    original: keyword,
-    search: caseSensitive ? keyword : keyword.toLowerCase(),
-  }));
+  const targets = prepareKeywordTargets('containsAll', keywords, caseSensitive);
 
   return createMetricFn(name, (async (result) => {
     const output = caseSensitive ? result.output : result.output.toLowerCase();
@@ -152,16 +177,9 @@ export function containsAll(keywords: string[], opts?: MatchOptions): MetricFn {
 
 /** Scores 1 when the output contains at least one keyword, and 0 otherwise. */
 export function containsAny(keywords: string[], opts?: MatchOptions): MetricFn {
-  if (keywords.length === 0) {
-    throw new Error('containsAny requires at least one keyword');
-  }
-
   const caseSensitive = opts?.caseSensitive ?? false;
   const name = opts?.name ?? 'containsAny';
-  const targets = keywords.map((keyword) => ({
-    original: keyword,
-    search: caseSensitive ? keyword : keyword.toLowerCase(),
-  }));
+  const targets = prepareKeywordTargets('containsAny', keywords, caseSensitive);
 
   return createMetricFn(name, (async (result) => {
     const output = caseSensitive ? result.output : result.output.toLowerCase();

@@ -200,7 +200,7 @@ const metrics = [
 ];
 ```
 
-`containsAll()` scores the fraction of its keywords found and reports any missing keywords in `details`. `containsAny()` scores 1 when at least one keyword is found and 0 otherwise. Both are case-insensitive by default, accept `caseSensitive` and `name` options, and reject an empty keyword list when the metric is created.
+`containsAll()` scores the fraction of its keywords found and reports any missing keywords in `details`. `containsAny()` scores 1 when at least one keyword is found and 0 otherwise. Keywords use substring matching, so `cat` matches `concatenate`. Both metrics are case-insensitive by default, accept `caseSensitive` and `name` options, ignore duplicate keywords, and reject empty lists or empty and whitespace-only keywords when the metric is created.
 
 `regex()` ignores the `g` and `y` flags, which would make identical outputs alternate between pass and fail.
 
