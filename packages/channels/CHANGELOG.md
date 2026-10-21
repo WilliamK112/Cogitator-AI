@@ -1,5 +1,17 @@
 # @cogitator-ai/channels
 
+## 0.12.4
+
+### Patch Changes
+
+- Updated dependencies [[`b42f62e`](https://github.com/cogitator-ai/Cogitator-AI/commit/b42f62ecd300cd945c42a91014b1297bc4e10c43)]:
+  - @cogitator-ai/core@0.46.0
+  - @cogitator-ai/types@0.48.0
+  - @cogitator-ai/browser@0.4.23
+  - @cogitator-ai/mcp@19.5.5
+  - @cogitator-ai/memory@0.13.3
+  - @cogitator-ai/rag@0.7.8
+
 ## 0.12.3
 
 ### Patch Changes
