@@ -1,5 +1,14 @@
 # @cogitator-ai/a2a
 
+## 0.8.14
+
+### Patch Changes
+
+- Updated dependencies [[`db16bbc`](https://github.com/cogitator-ai/Cogitator-AI/commit/db16bbc5f7c49b052382ea8dd4c0ba597216d913), [`db16bbc`](https://github.com/cogitator-ai/Cogitator-AI/commit/db16bbc5f7c49b052382ea8dd4c0ba597216d913)]:
+  - @cogitator-ai/types@0.49.0
+  - @cogitator-ai/core@0.47.0
+  - @cogitator-ai/server-shared@0.5.14
+
 ## 0.8.13
 
 ### Patch Changes

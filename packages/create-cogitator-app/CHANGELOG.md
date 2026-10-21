@@ -1,5 +1,14 @@
 # create-cogitator-app
 
+## 0.8.6
+
+### Patch Changes
+
+- [#223](https://github.com/cogitator-ai/Cogitator-AI/pull/223) [`db16bbc`](https://github.com/cogitator-ai/Cogitator-AI/commit/db16bbc5f7c49b052382ea8dd4c0ba597216d913) - Generated projects pin Biome to an exact version, as Biome recommends. Its formatting changes between releases and the scaffolder formats the project it writes, so a new release, or one published without its binaries, no longer breaks or changes scaffolding.
+- Updated dependencies []:
+  - @cogitator-ai/config@0.17.4
+  - @cogitator-ai/deploy@0.6.13
+
 ## 0.8.5
 
 ### Patch Changes

@@ -1,5 +1,22 @@
 # @cogitator-ai/core
 
+## 0.47.0
+
+### Minor Changes
+
+- [#223](https://github.com/cogitator-ai/Cogitator-AI/pull/223) [`db16bbc`](https://github.com/cogitator-ai/Cogitator-AI/commit/db16bbc5f7c49b052382ea8dd4c0ba597216d913) - `RunOptions.onModelTurn` reports each model turn a run keeps, `{ content, toolCalls, model }`, as every `afterModel` middleware left it and before its tool calls run. A run without `stream: true` gets the text of a turn that calls tools only from here, and a run's own middleware, which sits inside the Cogitator's and the agent's, sees a turn before they do.
+
+  A run that uses memory refuses an empty `threadId` with `VALIDATION_ERROR`, as memory adapters no longer create a thread without an id.
+
+  A tool call that repeats the previous turn's calls, which the run answers with an error instead of running it, is now reported to `onToolCall` and `onToolResult` like any other.
+
+### Patch Changes
+
+- Updated dependencies [[`db16bbc`](https://github.com/cogitator-ai/Cogitator-AI/commit/db16bbc5f7c49b052382ea8dd4c0ba597216d913), [`db16bbc`](https://github.com/cogitator-ai/Cogitator-AI/commit/db16bbc5f7c49b052382ea8dd4c0ba597216d913)]:
+  - @cogitator-ai/types@0.49.0
+  - @cogitator-ai/memory@0.14.0
+  - @cogitator-ai/sandbox@0.6.6
+
 ## 0.46.0
 
 ### Minor Changes
